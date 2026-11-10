@@ -38,6 +38,11 @@ from lerobot.utils.sample_weighting import SampleWeightingConfig
 
 from . import parser
 from .default import DatasetConfig, EvalConfig, JobConfig, PeftConfig, TrackioConfig
+from .experiment import (
+    ExperimentConfigMetadata,
+    load_experiment_metadata,
+    save_experiment_metadata,
+)
 from .policies import PreTrainedConfig
 from .rewards import RewardModelConfig
 
@@ -447,6 +452,9 @@ class TrainPipelineConfig(HubMixin):
     def _save_pretrained(self, save_directory: Path) -> None:
         with open(save_directory / TRAIN_CONFIG_NAME, "w") as f, draccus.config_type("json"):
             draccus.dump(self, f, indent=4)
+        experiment_metadata = getattr(self, "_experiment_config_metadata", None)
+        if experiment_metadata is not None:
+            save_experiment_metadata(experiment_metadata, save_directory)
 
     @classmethod
     def from_pretrained(
@@ -496,6 +504,25 @@ class TrainPipelineConfig(HubMixin):
                 )
 
         cli_args = kwargs.pop("cli_args", [])
+        source_config_file = Path(config_file) if config_file is not None else None
+
+        if config_file is not None and Path(config_file).suffix.lower() in {".yaml", ".yml"}:
+            # A YAML path is an experiment config, not a checkpoint config. The
+            # parser also extracts policy.path and carries it through the normal
+            # LeRobot pretrained-policy loading path.
+            config_file = parser.extract_path_fields_from_config(config_file, cls.__get_path_fields__())
+            with draccus.config_type("yaml"):
+                config = draccus.parse(cls, config_file, args=cli_args)
+            experiment_metadata = parser.pop_experiment_config_metadata(config_file)
+            if config.resume:
+                raise ValueError(
+                    "A YAML config starts a new run. To resume, pass --config_path pointing "
+                    "at a checkpoint train_config.json or pretrained_model directory."
+                )
+            if experiment_metadata is not None:
+                config._experiment_config_metadata = experiment_metadata
+            return config
+
         # Legacy migrations (RA-BC fields, pre-Trackio `wandb` section) only apply to framework-saved
         # checkpoints (always JSON). Hand-written YAML/TOML configs are expected to use the current schema.
         if config_file is not None and config_file.endswith(".json"):
@@ -512,4 +539,9 @@ class TrainPipelineConfig(HubMixin):
                     config_file = f.name
 
         with draccus.config_type("json"):
-            return draccus.parse(cls, config_file, args=cli_args)
+            config = draccus.parse(cls, config_file, args=cli_args)
+        if source_config_file is not None:
+            experiment_metadata = load_experiment_metadata(source_config_file.parent)
+            if experiment_metadata is not None:
+                config._experiment_config_metadata = experiment_metadata
+        return config

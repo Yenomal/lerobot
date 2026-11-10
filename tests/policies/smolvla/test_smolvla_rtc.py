@@ -34,7 +34,7 @@ def test_smolvla_rtc_initialization():
     """Test SmolVLA policy can initialize RTC processor."""
     set_seed(42)
 
-    config = SmolVLAConfig(max_action_dim=7, chunk_size=50)
+    config = SmolVLAConfig(state_dim=14, action_dim=7, max_action_dim=7, chunk_size=50)
 
     # Add RTC config
     config.rtc_config = RTCConfig(
@@ -73,7 +73,7 @@ def test_smolvla_rtc_initialization_without_rtc_config():
     """Test SmolVLA policy can initialize without RTC config."""
     set_seed(42)
 
-    config = SmolVLAConfig(max_action_dim=7, chunk_size=50)
+    config = SmolVLAConfig(state_dim=14, action_dim=7, max_action_dim=7, chunk_size=50)
 
     # Instantiate policy on the GPU: initializing the VLM weights on the CPU is slow
     with torch.device("cuda"):
@@ -96,7 +96,7 @@ def test_smolvla_rtc_inference_with_prev_chunk():
     """Test SmolVLA policy inference with RTC and previous chunk."""
     set_seed(42)
 
-    config = SmolVLAConfig(max_action_dim=7, chunk_size=50)
+    config = SmolVLAConfig(state_dim=14, action_dim=7, max_action_dim=7, chunk_size=50)
 
     # Add RTC config
     config.rtc_config = RTCConfig(
@@ -178,7 +178,7 @@ def test_smolvla_rtc_inference_without_prev_chunk():
     """Test SmolVLA policy inference with RTC but no previous chunk (RTC should have no effect)."""
     set_seed(42)
 
-    config = SmolVLAConfig(max_action_dim=7, chunk_size=50)
+    config = SmolVLAConfig(state_dim=14, action_dim=7, max_action_dim=7, chunk_size=50)
 
     # Add RTC config
     config.rtc_config = RTCConfig(
@@ -251,7 +251,7 @@ def test_smolvla_rtc_validation_rules():
     """Test SmolVLA policy with RTC follows all three validation rules."""
     set_seed(42)
 
-    config = SmolVLAConfig(max_action_dim=7, chunk_size=50)
+    config = SmolVLAConfig(state_dim=14, action_dim=7, max_action_dim=7, chunk_size=50)
 
     # Add RTC config
     config.rtc_config = RTCConfig(

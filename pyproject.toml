@@ -59,7 +59,8 @@ keywords = ["lerobot", "huggingface", "robotics",  "machine learning", "artifici
 
 dependencies = [
     # Core ML
-    "torch>=2.7,<2.16.0",
+    "torch>=2.7,<2.15.0; sys_platform == 'linux'",
+    "torch>=2.7,<2.16.0; sys_platform != 'linux'",
     "torchvision>=0.22.0,<0.30.0",
     "numpy>=2.0.0,<2.3.0", # NOTE: Explicitly listing numpy helps the resolver converge faster. Upper bound imposed by opencv-python-headless.
     "opencv-python-headless>=4.9.0,<4.14.0",
@@ -72,6 +73,8 @@ dependencies = [
     "filelock>=4.2.1,<5.0.0",
     "fsspec>=2023.5.0,<2027.0.0",
     "requests>=2.32.0,<3.0.0",
+    # Hugging Face Hub uses httpx; include SOCKS support for proxy-based downloads.
+    "httpx[socks]>=0.28.1,<0.29.0",
 
     # Environments
     # NOTE: gymnasium is used in lerobot.envs, lerobot.sim and lerobot.env_server (lerobot-train,
@@ -418,16 +421,25 @@ lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-annotate="lerobot.scripts.lerobot_annotate:main"
 lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
 lerobot-policy-server="lerobot.scripts.lerobot_policy_server:main"
+lerobot-runtime-server="lerobot.runtime_server:main"
 
 # ---------------- Tool Configurations ----------------
 
-# torch and torchvision come from PyPI; docs/source/installation.mdx covers other CUDA builds.
+# Linux x86_64 uses CUDA 12.6 PyTorch wheels for compatibility with CUDA 12.x host drivers.
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
+# The project requires one CUDA build that also works on hosts with CUDA 12.x drivers.
+torch = [{ index = "pytorch-cu126", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+torchvision = [{ index = "pytorch-cu126", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
 # LeRobot decodes videos on CPU; avoid GPU-only TorchCodec dependencies without changing GPU training.
 torchcodec = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'arm64')" }]
 

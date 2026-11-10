@@ -40,6 +40,7 @@ from lerobot.processor import (
 )
 from lerobot.utils.constants import (
     ACTION,
+    OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
@@ -317,6 +318,20 @@ def make_policy(
     parent_path = cfg.pretrained_path
     if pretrained_path is not None:
         cfg.pretrained_path = Path(pretrained_path)
+
+    # Keep the base checkpoint's active state/action widths before the dataset
+    # replaces output_features below. SmolVLA stores projections padded to 32,
+    # but channels beyond these feature widths were not active training inputs.
+    if cfg.type == "smolvla" and cfg.pretrained_path:
+        pretrained_projection_dims: dict[str, int] = {}
+        pretrained_state = (cfg.input_features or {}).get(OBS_STATE)
+        pretrained_action = (cfg.output_features or {}).get(ACTION)
+        if pretrained_state is not None:
+            pretrained_projection_dims["state"] = pretrained_state.shape[0]
+        if pretrained_action is not None:
+            pretrained_projection_dims["action"] = pretrained_action.shape[0]
+        if pretrained_projection_dims:
+            cfg._pretrained_projection_dims = pretrained_projection_dims
 
     kwargs: dict[str, Any] = {}
     if ds_meta is not None:

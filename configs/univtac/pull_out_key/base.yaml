@@ -1,0 +1,25 @@
+# Task-level UniVTAC/Panda settings shared by dated experiments.
+schema_version: 1
+extends: ../../default.yaml
+repo_id: univtac/pull_out_key
+
+dataset:
+  root: /root/datasets/univtac/pull_out_key_v30
+  video_backend: pyav
+
+policy:
+  path: lerobot/smolvla_base
+  state_dim: 9
+  action_dim: 9
+  adapt_pretrained_dimensions: true
+  freeze_vision_encoder: true
+  train_expert_only: true
+  device: cuda
+  push_to_hub: false
+
+rename_map:
+  observation.images.head: observation.images.camera1
+  observation.images.wrist: observation.images.camera2
+
+batch_size: 32
+num_workers: 16

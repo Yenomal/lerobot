@@ -52,6 +52,7 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 """
 
+import logging
 import math
 from collections import deque
 from typing import Any, Unpack
@@ -59,6 +60,8 @@ from typing import Any, Unpack
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
+from safetensors import safe_open
+from safetensors.torch import load_file
 
 from lerobot.configs import FeatureType
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
@@ -81,6 +84,7 @@ from ..common.vla_utils import (
 from ..pretrained import PreTrainedPolicy, RTCActionSelectKwargs
 from ..rtc.modeling_rtc import RTCProcessor
 from ..utils import (
+    log_model_loading_keys,
     populate_queues,
 )
 from .configuration_smolvla import SmolVLAConfig
@@ -168,6 +172,77 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self.init_rtc_processor()
         self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
         self.reset()
+
+    @classmethod
+    def _load_as_safetensor(cls, model, model_file, map_location, strict):
+        """Load weights, optionally adapting the three embodiment projections."""
+        if not model.config.adapt_pretrained_dimensions:
+            return super()._load_as_safetensor(model, model_file, map_location, strict)
+
+        own_state = model.state_dict()
+        with safe_open(model_file, framework="pt", device="cpu") as checkpoint_file:
+            mismatched_keys = [
+                key
+                for key in checkpoint_file.keys()
+                if key in own_state and tuple(checkpoint_file.get_slice(key).get_shape()) != tuple(own_state[key].shape)
+            ]
+        if not mismatched_keys:
+            return super()._load_as_safetensor(model, model_file, map_location, strict)
+
+        # Load on CPU so opting into adaptation does not create a full duplicate
+        # of the checkpoint in GPU memory during fine-tuning initialization.
+        checkpoint = load_file(model_file, device="cpu")
+        projection_axes = {
+            "model.state_proj.weight": 1,
+            "model.action_in_proj.weight": 1,
+            "model.action_out_proj.weight": 0,
+            "model.action_out_proj.bias": 0,
+        }
+        pretrained_projection_dims = getattr(model.config, "_pretrained_projection_dims", {})
+        adapted = []
+        for key, value in checkpoint.items():
+            expected = own_state.get(key)
+            if expected is None or expected.shape == value.shape:
+                continue
+            axis = projection_axes.get(key)
+            if axis is None or value.ndim != expected.ndim or value.ndim not in (1, 2):
+                raise ValueError(
+                    f"Cannot adapt incompatible SmolVLA checkpoint tensor {key}: "
+                    f"checkpoint shape {tuple(value.shape)}, model shape {tuple(expected.shape)}."
+                )
+            other_axis = 1 - axis if value.ndim == 2 else None
+            if other_axis is not None and value.shape[other_axis] != expected.shape[other_axis]:
+                raise ValueError(
+                    f"Cannot adapt SmolVLA projection {key}: non-embodiment dimension differs "
+                    f"({tuple(value.shape)} vs {tuple(expected.shape)})."
+                )
+            adapted_value = expected.detach().cpu().clone()
+            copy_dim = min(value.shape[axis], expected.shape[axis])
+            active_dim = pretrained_projection_dims.get(
+                "state" if key == "model.state_proj.weight" else "action"
+            )
+            if active_dim is not None:
+                copy_dim = min(copy_dim, active_dim)
+            if value.ndim == 1:
+                adapted_value[:copy_dim] = value[:copy_dim]
+            elif axis == 0:
+                adapted_value[:copy_dim, :] = value[:copy_dim, :]
+            else:
+                adapted_value[:, :copy_dim] = value[:, :copy_dim]
+            checkpoint[key] = adapted_value
+            adapted.append(
+                f"{key}: {tuple(value.shape)} -> {tuple(expected.shape)}; copied {copy_dim} active dimensions"
+            )
+
+        missing_keys, unexpected_keys = model.load_state_dict(checkpoint, strict=False)
+        if adapted:
+            logging.getLogger(__name__).warning(
+                "Adapted pretrained SmolVLA projection tensors by overlap-copying: %s", "; ".join(adapted)
+            )
+        if strict and (missing_keys or unexpected_keys):
+            raise RuntimeError(f"Missing keys: {missing_keys}; unexpected keys: {unexpected_keys}")
+        log_model_loading_keys(missing_keys, unexpected_keys)
+        return model
 
     def reset(self):
         """This should be called whenever the environment is reset."""
@@ -331,7 +406,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             loss_dict["losses_after_in_ep_bound"] = losses.clone().mean().item()
 
         # Remove padding
-        losses = losses[:, :, : self.config.max_action_dim]
+        losses = losses[:, :, : self.config.action_dim]
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
 
         if reduction == "none":
@@ -460,14 +535,25 @@ class SmolVLAPolicy(PreTrainedPolicy):
         return actions
 
     def prepare_state(self, batch):
-        """Pad state"""
+        """Pad state to the configured dynamic state projection dimension."""
         state = batch[OBS_STATE][:, -1, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
-        state = pad_vector(state, self.config.max_state_dim)
+        if state.shape[-1] > self.config.state_dim:
+            raise ValueError(
+                f"SmolVLA received state dimension {state.shape[-1]}, but state_dim={self.config.state_dim}. "
+                "Set --policy.state_dim to the dataset state dimension."
+            )
+        state = pad_vector(state, self.config.state_dim)
         return state
 
     def prepare_action(self, batch):
-        """Pad action"""
-        actions = pad_vector(batch[ACTION], self.config.max_action_dim)
+        """Pad action to the configured dynamic action projection dimension."""
+        if batch[ACTION].shape[-1] > self.config.action_dim:
+            raise ValueError(
+                f"SmolVLA received action dimension {batch[ACTION].shape[-1]}, "
+                f"but action_dim={self.config.action_dim}. "
+                "Set --policy.action_dim to the dataset action dimension."
+            )
+        actions = pad_vector(batch[ACTION], self.config.action_dim)
         return actions
 
     def _get_default_peft_targets(self) -> dict[str, Any]:
@@ -559,10 +645,10 @@ class VLAFlowMatching(nn.Module):
             device=self.config.device if self.config.device is not None else "auto",
         )
         self.state_proj = nn.Linear(
-            self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
+            self.config.state_dim, self.vlm_with_expert.config.text_config.hidden_size
         )
-        self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
-        self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
+        self.action_in_proj = nn.Linear(self.config.action_dim, self.vlm_with_expert.expert_hidden_size)
+        self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.action_dim)
 
         self.action_time_mlp_in = nn.Linear(
             self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
@@ -788,7 +874,7 @@ class VLAFlowMatching(nn.Module):
         device = state.device
 
         if noise is None:
-            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+            actions_shape = (bsize, self.config.chunk_size, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
         else:
             noise = noise.to(device=device, dtype=torch.float32)

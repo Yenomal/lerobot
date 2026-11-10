@@ -38,6 +38,8 @@ from draccus.wrappers.wrapper import AggregateWrapper, Wrapper
 
 from lerobot.utils.utils import has_method
 
+from .experiment import ExperimentConfigError, ExperimentConfigMetadata, resolve_experiment_config
+
 F = TypeVar("F", bound=Callable[..., object])
 
 PATH_KEY = "path"
@@ -49,6 +51,10 @@ _config_path_args: dict[str, str] = {}
 
 # Storage for non-path YAML overrides so validate() can pass them to from_pretrained.
 _config_yaml_overrides: dict[str, list[str]] = {}
+
+# Provenance for a resolved, layered experiment config passed through Draccus's
+# temporary config file after special ``policy.path`` fields have been removed.
+_experiment_config_metadata: dict[str, ExperimentConfigMetadata] = {}
 
 
 # Register draccus encode/decode functions for the torch.dtype values held by dtype fields.
@@ -226,6 +232,11 @@ def get_yaml_overrides(field_name: str) -> list[str]:
     return _config_yaml_overrides.get(field_name, [])
 
 
+def pop_experiment_config_metadata(config_path: str | Path) -> ExperimentConfigMetadata | None:
+    """Take the source/resolved YAML provenance associated with a temp config."""
+    return _experiment_config_metadata.pop(str(Path(config_path).resolve()), None)
+
+
 def get_pretrained_revision(field_name: str) -> str | None:
     """Return `--<field_name>.pretrained_revision` from the CLI, else from the `--config_path` file."""
     revision = parse_arg("pretrained_revision", get_cli_overrides(field_name) or [])
@@ -377,9 +388,22 @@ def extract_path_fields_from_config(config_path: str, path_fields: list[str]) ->
     config_file = Path(config_path)
     suffix = config_file.suffix.lower()
 
+    experiment_metadata = None
     if suffix in (".yaml", ".yml"):
-        with open(config_file) as f:
-            config_data = yaml.safe_load(f)
+        # The layered experiment schema currently belongs to lerobot-train.
+        # Other path-aware CLIs (eval, rollout, env server) keep their ordinary
+        # Draccus YAML behavior, including any application-specific `extends`.
+        experiment = (
+            resolve_experiment_config(config_file)
+            if "reward_model" in path_fields
+            else None
+        )
+        if experiment is not None:
+            config_data = experiment.config
+            experiment_metadata = experiment.metadata
+        else:
+            with open(config_file) as f:
+                config_data = yaml.safe_load(f)
     elif suffix == ".json":
         with open(config_file) as f:
             config_data = json.load(f)
@@ -389,7 +413,9 @@ def extract_path_fields_from_config(config_path: str, path_fields: list[str]) ->
     if not isinstance(config_data, dict):
         return config_path
 
-    modified = False
+    # Layered experiments must be materialized into one Draccus-readable file
+    # even when there are no special ``*.path`` fields to extract.
+    modified = experiment_metadata is not None
     for field in path_fields:
         if field in config_data and isinstance(config_data[field], dict) and PATH_KEY in config_data[field]:
             _config_path_args[field] = str(config_data[field].pop(PATH_KEY))
@@ -408,6 +434,8 @@ def extract_path_fields_from_config(config_path: str, path_fields: list[str]) ->
             yaml.dump(config_data, tmp, default_flow_style=False)
         else:
             json.dump(config_data, tmp, indent=2)
+    if experiment_metadata is not None:
+        _experiment_config_metadata[str(Path(tmp.name).resolve())] = experiment_metadata
     return tmp.name
 
 
@@ -449,7 +477,11 @@ def wrap(config_path: Path | None = None) -> Callable[[F], F]:
                     cli_args = filter_path_args(path_fields, cli_args)
                     # Also extract path fields from the YAML/JSON config file
                     if config_path_cli:
-                        config_path_cli = extract_path_fields_from_config(config_path_cli, path_fields)
+                        try:
+                            config_path_cli = extract_path_fields_from_config(config_path_cli, path_fields)
+                        except ExperimentConfigError as e:
+                            print(f"error: {e}", file=sys.stderr)
+                            sys.exit(1)
                 try:
                     if has_method(argtype, "from_pretrained") and config_path_cli:
                         cli_args = filter_arg("config_path", cli_args)

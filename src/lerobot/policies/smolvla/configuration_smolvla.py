@@ -37,9 +37,22 @@ class SmolVLAConfig(PreTrainedConfig):
         }
     )
 
-    # Shorter state and action vectors will be padded
+    # Input dimensions for the state/action projection MLPs.  SmolVLA used to
+    # hard-code a 32-dimensional padded vector here, which made checkpoints
+    # unnecessarily tied to one embodiment.  Keep the small default used by
+    # the lightweight policy and override these explicitly for a dataset with
+    # a different number of joints (for example, ``--policy.state_dim=9
+    # --policy.action_dim=9``).
+    state_dim: int = 6
+    action_dim: int = 6
+
+    # Legacy padding fields kept in the serialized config for compatibility
+    # with older SmolVLA checkpoints.  New model code uses state_dim/action_dim.
     max_state_dim: int = 32
     max_action_dim: int = 32
+    # Explicitly enable overlap-copy adaptation when loading a legacy projection
+    # checkpoint whose padded 32-wide MLPs differ from the configured dimensions.
+    adapt_pretrained_dimensions: bool = False
 
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
@@ -111,6 +124,8 @@ class SmolVLAConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        if self.state_dim <= 0 or self.action_dim <= 0:
+            raise ValueError(f"SmolVLA state_dim/action_dim must be positive, got {self.state_dim}/{self.action_dim}.")
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
@@ -124,6 +139,28 @@ class SmolVLAConfig(PreTrainedConfig):
     def validate_features(self) -> None:
         if self.input_features is None:
             raise ValueError("`input_features` must be resolved before `validate_features()` is called.")
+
+        state_shape = None
+        dataset_meta = getattr(self, "_runtime_dataset_meta", None)
+        if dataset_meta is not None:
+            dataset_state = dataset_meta.features.get("observation.state")
+            if dataset_state is not None:
+                state_shape = dataset_state.get("shape")
+        if state_shape is None:
+            state_feature = self.input_features.get("observation.state")
+            state_shape = state_feature.shape if state_feature is not None else None
+        if state_shape is not None and state_shape[0] > self.state_dim:
+            raise ValueError(
+                f"Dataset state dimension {state_shape[0]} exceeds SmolVLA state_dim={self.state_dim}. "
+                "Set --policy.state_dim to the dataset dimension."
+            )
+        action_feature = (self.output_features or {}).get("action")
+        if action_feature is not None and action_feature.shape[0] > self.action_dim:
+            raise ValueError(
+                f"Dataset action dimension {action_feature.shape[0]} exceeds SmolVLA action_dim={self.action_dim}. "
+                "Set --policy.action_dim to the dataset dimension."
+            )
+
         for i in range(self.empty_cameras):
             key = f"{OBS_IMAGES}.empty_camera_{i}"
             empty_camera = PolicyFeature(

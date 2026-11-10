@@ -56,3 +56,9 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 - **Video decoding**: datasets can store observations as video files. `LeRobotDataset` handles frame extraction, but tests need ffmpeg installed.
 - **Prioritize use of `uv run`** to execute Python commands (not raw `python` or `pip`).
 - **Test marks**: Fast Tests runs one tier per extra (`-m base|dataset|hardware|viz`) and the GPU job runs `-m gpu`. A test that needs the `dataset`, `hardware` or `viz` extra must be marked (`pytestmark = pytest.mark.dataset`), otherwise it only runs in `base` and skips there. A test that uses CUDA outside `tests/policies` and without `@require_cuda` needs `@pytest.mark.gpu`. Details in CONTRIBUTING.md, "Running Tests".
+
+## 其他注意事项
+
+- 训练时，每次有新增的配置项就写入默认配置文件../configs/default.yaml，并存放代码内的默认值（注意这里只写训练时配置，也就是说scripts/train.py使用的配置，推理时不要写）
+
+- 推理时，新增的命令行参数写入docs/cmd.md：### Runtime 管理的 VLM/FM（两张 GPU）

@@ -1,0 +1,25 @@
+# YAML experiment configs
+
+`lerobot-train` can load a layered experiment YAML through the existing `--config_path` option. The YAML is resolved first, then decoded into LeRobot's `TrainPipelineConfig`, dataset config, and registered policy dataclasses. CLI flags still override YAML values.
+
+The file layout is `configs/default.yaml` → `configs/<scenario>/<task>/base.yaml` → `YYYYMMDD_id.yaml`. `default.yaml` contains shared training-pipeline defaults; required dataset identity belongs in a task base, while policy-specific fields follow the selected LeRobot policy dataclass because LeRobot supports different policy schemas. The experiment's `repo_id` identifies the dataset and output namespace, `exp_name` defaults to the dated filename, and the default output path is `outputs/train/<repo_id>/<exp_name>`.
+
+The UniVTAC pull-out-key example under `configs/univtac/pull_out_key/` puts task-level settings in `base.yaml` and run-specific settings in `20261109_001.yaml`. Its `scripts` field describes the weight/run meaning; the resolver keeps it in the source and resolved YAML but removes it before parsing the training dataclass.
+
+Experiments use `schema_version: 1` and may extend relative YAML paths. Mapping fields merge recursively; lists and scalar values replace inherited values; `null` is an explicit override. Unknown LeRobot fields are rejected by the normal Draccus decoder.
+
+```bash
+lerobot-train \
+  --config_path=configs/univtac/pull_out_key/20261109_001.yaml
+```
+
+Additional flags override the resolved values without editing the experiment file:
+
+```bash
+lerobot-train \
+  --config_path=configs/univtac/pull_out_key/20261109_001.yaml \
+  --steps=1000 \
+  --num_workers=8
+```
+
+Each saved policy checkpoint includes the original `experiment.yaml`, its fully inherited `resolved_experiment.yaml`, and LeRobot's effective `train_config.json`. The YAML sidecars preserve experiment provenance; resume continues to use `--config_path` pointing at a checkpoint's `train_config.json` or `pretrained_model/` directory.

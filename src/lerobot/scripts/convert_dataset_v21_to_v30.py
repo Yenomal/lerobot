@@ -190,7 +190,14 @@ def convert_tasks(root, new_root):
 
 def concat_data_files(paths_to_cat, new_root, chunk_idx, file_idx, image_keys):
     # TODO(rcadene): to save RAM use Dataset.from_parquet(file) and concatenate_datasets
-    dataframes = [pd.read_parquet(file) for file in paths_to_cat]
+    # Pandas extension dtypes from older `datasets` versions (notably Array3D)
+    # are not stable across current pandas releases and can fail during concat.
+    # Read through Arrow's plain Python representation so extension/list columns
+    # become ordinary object columns before concatenation.
+    dataframes = []
+    for file in paths_to_cat:
+        table = pa.parquet.read_table(file)
+        dataframes.append(pd.DataFrame(table.to_pydict()))
     # Concatenate all DataFrames along rows
     concatenated_df = pd.concat(dataframes, ignore_index=True)
 
