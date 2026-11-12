@@ -108,6 +108,7 @@ from lerobot.utils.io_utils import load_json, write_json
 from lerobot.utils.process import ProcessSignalHandler, ensure_multiprocessing_start_method
 from lerobot.utils.random_utils import load_rng_state, set_seed
 from lerobot.utils.utils import (
+    count_parameters,
     format_big_number,
     init_logging,
 )
@@ -789,8 +790,8 @@ def log_training_info(cfg: TrainRLServerPipelineConfig, policy: nn.Module) -> No
         cfg (TrainRLServerPipelineConfig): Training configuration
         policy (nn.Module): Policy model
     """
-    num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-    num_total_params = sum(p.numel() for p in policy.parameters())
+    num_learnable_params = count_parameters(policy.parameters(), trainable_only=True)
+    num_total_params = count_parameters(policy.parameters())
 
     logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
     logging.info(f"{cfg.env.task=}")

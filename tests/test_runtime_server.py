@@ -74,6 +74,49 @@ def test_runtime_task_change_drops_old_plan_after_acknowledgement():
     assert calls == 2
 
 
+def test_runtime_session_uses_split_prefix_and_refreshes_it_as_the_window_advances():
+    policy = ConformingPolicy(tiny_config())
+    policy.config.streaming = True
+    policy.config.streaming_chunk_size = 2
+    prefix_calls = 0
+    fm_calls = 0
+
+    def encode_prefix(batch):
+        nonlocal prefix_calls
+        prefix_calls += 1
+        return {"prefix": prefix_calls}
+
+    def predict_from_prefix(batch, prefix_cache, **kwargs):
+        nonlocal fm_calls
+        fm_calls += 1
+        return policy.predict_action_chunk(batch, **kwargs)
+
+    policy.encode_prefix = encode_prefix
+    policy.predict_action_chunk_from_prefix = predict_from_prefix
+    runtime = RuntimeSession(
+        runner_for(policy),
+        queue_size=1,
+        streaming_horizon=4,
+        streaming_watermark=2,
+    )
+    features = {
+        "observation.state": np.zeros(3, dtype=np.float32),
+        "observation.environment_state": np.zeros(3, dtype=np.float32),
+    }
+
+    first = runtime.infer(features, "task", 1)
+    runtime.acknowledge(first["action_id"])
+    second = runtime.infer(features, "task", 2)
+    runtime.acknowledge(second["action_id"])
+    third = runtime.infer(features, "task", 3)
+    runtime.acknowledge(third["action_id"])
+    runtime.close()
+
+    assert prefix_calls >= 2
+    assert fm_calls >= 2
+    assert third["streaming"]["refresh_after"] == 2
+
+
 def test_runtime_protocol_round_trip_keeps_observation_arrays_and_ack_identity():
     pytest.importorskip("msgpack")
     message = observation("robot-a", 4, {"state": np.array([1, 2], dtype=np.float32)}, task="move")

@@ -62,3 +62,5 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 - 训练时，每次有新增的配置项就写入默认配置文件../configs/default.yaml，并存放代码内的默认值（注意这里只写训练时配置，也就是说scripts/train.py使用的配置，推理时不要写）
 
 - 推理时，新增的命令行参数写入docs/cmd.md：### Runtime 管理的 VLM/FM（两张 GPU）
+
+- 我的话题一般都围绕SmolVLA以及配套的server runtime推理

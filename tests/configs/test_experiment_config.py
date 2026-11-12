@@ -66,7 +66,12 @@ def test_global_default_covers_train_pipeline_and_dataset_defaults():
     experiment_metadata_fields = {"schema_version", "repo_id", "exp_name", "scripts", "output_base_dir"}
     assert set(defaults) - experiment_metadata_fields == train_fields
     assert set(defaults["dataset"]) == dataset_fields - {"repo_id"}
-    assert defaults["policy"] is None  # the task base selects a policy schema
+    assert defaults["policy"]["type"] == "smolvla"
+    assert defaults["policy"]["streaming"] is False
+    assert defaults["policy"]["streaming_chunk_size"] == 5
+    assert defaults["policy"]["streaming_attention_mode"] == "bidirectional"
+    assert defaults["policy"]["use_tactile"] is False
+    assert "n_action_steps" not in defaults["policy"]
 
 
 def test_resolve_experiment_inheritance_recursively_overrides_scalars(tmp_path):
@@ -81,12 +86,10 @@ def test_resolve_experiment_inheritance_recursively_overrides_scalars(tmp_path):
     assert resolved.config["output_dir"] == "outputs/train/owner/univtac/20261109_001"
     assert resolved.config["job_name"] == "20261109_001"
     assert "scripts" not in resolved.config
-    assert resolved.config["policy"] == {
-        "path": "lerobot/smolvla_base",
-        "state_dim": 9,
-        "action_dim": 9,
-        "adapt_pretrained_dimensions": True,
-    }
+    assert resolved.config["policy"]["path"] == "lerobot/smolvla_base"
+    assert resolved.config["policy"]["state_dim"] == 9
+    assert resolved.config["policy"]["action_dim"] == 9
+    assert resolved.config["policy"]["adapt_pretrained_dimensions"] is True
     assert b"extends:" not in resolved.metadata.resolved_bytes
     assert b"scripts: test description only" in resolved.metadata.resolved_bytes
     assert resolved.metadata.source_bytes == experiment.read_bytes()

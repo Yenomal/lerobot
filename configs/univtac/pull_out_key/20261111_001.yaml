@@ -1,0 +1,13 @@
+schema_version: 1
+extends: base.yaml
+
+exp_name: "20261111_001"
+scripts: "streaming with delay token 20 and bidirectional"
+
+policy:
+  n_obs_steps: 21
+  streaming: true
+  streaming_attention_mode: bidirectional
+  observation_delay_max_tokens: 20
+  use_observation_delay_embedding: false
+  use_observation_delay_adarms: false

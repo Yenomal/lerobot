@@ -3,6 +3,3 @@ extends: base.yaml
 
 exp_name: "20261109_001"
 scripts: "SmolVLA fine-tune: Panda 7 arm joints + 2 gripper fingers; base=lerobot/smolvla_base; task=Empty; tactile fields are not consumed by SmolVLA."
-steps: 8000
-log_freq: 100
-save_freq: 8000

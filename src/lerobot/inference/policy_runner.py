@@ -204,8 +204,15 @@ class PolicyRunner:
             raise ValueError("State and action component order must be aligned.")
 
     def _batch(self, observation: ObservationSnapshot) -> dict[str, Any]:
-        if set(observation.features) != {feature.name for feature in self.capabilities.features}:
-            raise ValueError("Observation feature names differ from the serving contract.")
+        expected_names = {feature.name for feature in self.capabilities.features}
+        received_names = set(observation.features)
+        if received_names != expected_names:
+            missing = sorted(expected_names - received_names)
+            unexpected = sorted(received_names - expected_names)
+            raise ValueError(
+                "Observation feature names differ from the serving contract: "
+                f"missing={missing}, unexpected={unexpected}, expected={sorted(expected_names)}"
+            )
         if len(observation.task) > self.max_text_input:
             raise ValueError("Instruction exceeds the configured text-input limit.")
         batch: dict[str, Any] = {}
@@ -234,14 +241,88 @@ class PolicyRunner:
         model_continuation: torch.Tensor | None = None,
         canonical_continuation: torch.Tensor | None = None,
         provenance: ActionProvenance | None = None,
+        inference_mode: str | None = None,
     ) -> ActionChunk:
         """Preprocess a fresh snapshot and return a validated canonical action chunk."""
         mode = ExecutionMode(mode)
         if mode not in self.capabilities.modes:
             raise ValueError(f"Execution mode {mode.value!r} was not enabled by this deployment.")
+        prepared = self.preprocessor(self._batch(observation))
+        return self._predict_prepared(
+            prepared,
+            observation=observation,
+            mode=mode,
+            inference_delay=inference_delay,
+            model_continuation=model_continuation,
+            canonical_continuation=canonical_continuation,
+            provenance=provenance,
+            policy_kwargs=None if inference_mode is None else {"inference_mode": inference_mode},
+        )
+
+    def encode_prefix(self, observation: ObservationSnapshot) -> tuple[dict[str, Any], Any]:
+        """Prepare one observation and encode a policy-specific VLM prefix."""
+        encoder = getattr(self.policy, "encode_prefix", None)
+        if not callable(encoder):
+            raise ValueError("The loaded policy does not expose split prefix encoding.")
+        prepared = self.preprocessor(self._batch(observation))
+        return prepared, encoder(prepared)
+
+    def predict_from_prefix(
+        self,
+        prepared: dict[str, Any],
+        prefix_cache: Any,
+        *,
+        observation: ObservationSnapshot,
+        provenance: ActionProvenance | None = None,
+        inference_mode: str = "stream",
+        context_cfg_lambda: float = 0.1,
+        observation_delay_tokens: int | None = None,
+        observation_delay_chunks: int | None = None,
+    ) -> ActionChunk:
+        """Run the FM/action stage against an already encoded VLM prefix."""
+        predictor = getattr(self.policy, "predict_action_chunk_from_prefix", None)
+        if not callable(predictor):
+            raise ValueError("The loaded policy does not expose split prefix inference.")
+        # The VLM cache may intentionally lag behind the control stream. Build
+        # a fresh FM batch from the current observation so dynamic conditions
+        # such as tactile tokens are refreshed for every denoising invocation.
+        fm_prepared = self.preprocessor(self._batch(observation))
+        if observation_delay_tokens is not None:
+            fm_prepared["observation_delay_tokens"] = torch.tensor(
+                [observation_delay_tokens], dtype=torch.long
+            )
+        if observation_delay_chunks is not None:
+            fm_prepared["observation_delay_chunks"] = torch.tensor(
+                [observation_delay_chunks], dtype=torch.long
+            )
+        return self._predict_prepared(
+            fm_prepared,
+            observation=observation,
+            mode=ExecutionMode.CHUNK,
+            provenance=provenance,
+            predictor=lambda batch: predictor(
+                batch,
+                prefix_cache,
+                inference_mode=inference_mode,
+                context_cfg_lambda=context_cfg_lambda,
+            ),
+        )
+
+    def _predict_prepared(
+        self,
+        prepared: dict[str, Any],
+        *,
+        observation: ObservationSnapshot,
+        mode: ExecutionMode,
+        inference_delay: int = 0,
+        model_continuation: torch.Tensor | None = None,
+        canonical_continuation: torch.Tensor | None = None,
+        provenance: ActionProvenance | None = None,
+        predictor=None,
+        policy_kwargs: dict[str, Any] | None = None,
+    ) -> ActionChunk:
         started = time.perf_counter()
         with chunk_inference_context(mode):
-            prepared = self.preprocessor(self._batch(observation))
             preprocessed_at = time.perf_counter()
             prediction = predict_chunk(
                 self.policy,
@@ -258,6 +339,8 @@ class PolicyRunner:
                 canonical_continuation=canonical_continuation,
                 relative_step=self._relative_step,
                 normalizer_step=self._normalizer_step,
+                predictor=predictor,
+                policy_kwargs=policy_kwargs,
             )
             self._model_action_dim = prediction.model_actions.shape[1]
             self.capabilities = replace(self.capabilities, model_action_dim=self._model_action_dim)

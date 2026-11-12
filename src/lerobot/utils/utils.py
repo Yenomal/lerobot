@@ -29,6 +29,7 @@ from statistics import mean
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from torch.nn.parameter import UninitializedParameter
 
 if TYPE_CHECKING:
     from accelerate import Accelerator
@@ -111,6 +112,16 @@ def format_big_number(num, precision=0):
         num /= divisor
 
     return num
+
+
+def count_parameters(parameters, *, trainable_only: bool = False) -> int:
+    """Count materialized parameters, tolerating lazy modules before first forward."""
+    return sum(
+        parameter.numel()
+        for parameter in parameters
+        if (not trainable_only or parameter.requires_grad)
+        and not isinstance(parameter, UninitializedParameter)
+    )
 
 
 def say(text: str, blocking: bool = False) -> None:

@@ -69,9 +69,31 @@ dataset:
   eval_split: 0.0
 
 env: null
-# Policy-specific fields are defined by the selected policy dataclass and
-# overridden in the task base; LeRobot supports multiple, incompatible policy schemas.
-policy: null
+# SmolVLA policy defaults. A task-level base or dated experiment can override
+# only the fields it needs; selecting another policy type replaces this mapping.
+policy:
+  type: smolvla
+  path: null
+  n_obs_steps: 1
+  chunk_size: 50
+  streaming: false
+  streaming_chunk_size: 5
+  streaming_attention_mode: bidirectional
+  streaming_constant_weight: 0.2
+  streaming_chunk_wise_weight: 0.8
+  observation_delay_max_chunks: 0
+  observation_delay_max_tokens: 0
+  use_observation_delay_embedding: false
+  use_observation_delay_adarms: false
+  use_tactile: false
+  use_tactile_adarms: false
+  use_tactile_token: false
+  use_tactile_token_history: false
+  tactile_token_history_length: 1
+  tactile_tcn_width: 256
+  tactile_feature_names:
+    - observation.tactile.left_marker
+    - observation.tactile.right_marker
 reward_model: null
 
 output_dir: null

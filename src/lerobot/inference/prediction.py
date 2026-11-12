@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
@@ -123,6 +123,8 @@ def predict_chunk(
     canonical_continuation: torch.Tensor | None = None,
     relative_step: RelativeActionsProcessorStep | None = None,
     normalizer_step: NormalizerProcessorStep | None = None,
+    predictor: Callable[[dict[str, Any]], torch.Tensor | PolicyOutput] | None = None,
+    policy_kwargs: dict[str, Any] | None = None,
 ) -> ChunkPrediction:
     """Predict and validate under exclusive policy/processor ownership.
 
@@ -131,7 +133,10 @@ def predict_chunk(
     """
     with chunk_inference_context(mode):
         if mode is ExecutionMode.CHUNK:
-            predicted = policy.predict_action_chunk(prepared)
+            if predictor is not None:
+                predicted = predictor(prepared)
+            else:
+                predicted = policy.predict_action_chunk(prepared, **(policy_kwargs or {}))
         else:
             prefix = _prepare_continuation(
                 model_continuation,

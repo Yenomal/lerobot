@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
-from lerobot.utils.constants import OBS_IMAGES
+from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
+from lerobot.utils.feature_utils import dataset_to_policy_features
 
 from ..rtc.configuration_rtc import RTCConfig
 
@@ -28,6 +30,41 @@ class SmolVLAConfig(PreTrainedConfig):
     n_obs_steps: int = 1
     chunk_size: int = 50
     n_action_steps: int = 50
+
+    # Research-time streaming controls shared with the Pi05 experiments.
+    # ``mask`` and ``bidirectional`` use the same action-block visibility rule
+    # as the reference implementation; ``causal`` advances attention at every
+    # streaming chunk boundary. ``random_gate`` samples a continuous gate in
+    # training and adds its log as an inter-chunk attention bias. Inference
+    # uses bidirectional attention for this mode.
+    streaming: bool = False
+    streaming_chunk_size: int = 5
+    streaming_attention_mode: str = "bidirectional"
+    streaming_constant_weight: float = 0.2
+    streaming_chunk_wise_weight: float = 0.8
+
+    # Observation-delay conditioning. The values are discrete chunk/token
+    # counts and are sampled by the policy during training when the dataset
+    # does not provide explicit delay fields.
+    observation_delay_max_chunks: int = 0
+    observation_delay_max_tokens: int = 0
+    use_observation_delay_embedding: bool = False
+    use_observation_delay_adarms: bool = False
+
+    # Tactile conditioning. The feature names are intentionally configurable
+    # because UniVTAC datasets use both dotted and flat naming conventions.
+    use_tactile: bool = False
+    use_tactile_adarms: bool = False
+    use_tactile_token: bool = False
+    use_tactile_token_history: bool = False
+    tactile_token_history_length: int = 1
+    # Width of the causal tactile history encoder. The resulting token is
+    # projected into the FM/action-expert stream and is refreshed per inference.
+    tactile_tcn_width: int = 256
+    tactile_feature_names: tuple[str, ...] = (
+        "observation.tactile.left_marker",
+        "observation.tactile.right_marker",
+    )
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -96,7 +133,9 @@ class SmolVLAConfig(PreTrainedConfig):
     scheduler_decay_lr: float = 2.5e-6
 
     vlm_model_name: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"  # Select the VLM backbone.
-    load_vlm_weights: bool = False  # Set to False in case of training the expert from scratch. True when init from pretrained SmolVLA weights
+    # Set to False when training the expert from scratch; set to True when
+    # initializing from pretrained SmolVLA weights.
+    load_vlm_weights: bool = False
 
     add_image_special_tokens: bool = False  # Whether to use special image tokens around image features.
 
@@ -106,7 +145,8 @@ class SmolVLAConfig(PreTrainedConfig):
 
     pad_language_to: str = "longest"  # "max_length"
 
-    num_expert_layers: int = -1  # Less or equal to 0 is the default where the action expert has the same number of layers of VLM. Otherwise the expert have less layers.
+    # Non-positive means that the action expert matches the VLM depth.
+    num_expert_layers: int = -1
     num_vlm_layers: int = 16  # Number of layers used in the VLM (first num_vlm_layers layers)
     self_attn_every_n_layers: int = 2  # Interleave SA layers each self_attn_every_n_layers
     expert_width_multiplier: float = 0.75  # The action expert hidden size (wrt to the VLM)
@@ -124,6 +164,45 @@ class SmolVLAConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        allowed_attention_modes = {"bidirectional", "mask", "causal", "random_gate"}
+        if self.streaming_attention_mode not in allowed_attention_modes:
+            raise ValueError(
+                "SmolVLA streaming_attention_mode must be one of: "
+                "bidirectional, mask, causal, random_gate"
+            )
+        if self.streaming_chunk_size <= 0:
+            raise ValueError("streaming_chunk_size must be positive")
+        if self.streaming and self.chunk_size % self.streaming_chunk_size != 0:
+            raise ValueError("chunk_size must be divisible by streaming_chunk_size when streaming=True")
+        if self.streaming_attention_mode == "random_gate" and not self.streaming:
+            raise ValueError("random_gate requires streaming=True")
+        if self.streaming_constant_weight < 0 or self.streaming_chunk_wise_weight < 0:
+            raise ValueError("streaming regime weights must be non-negative")
+        if self.streaming and self.streaming_constant_weight + self.streaming_chunk_wise_weight <= 0:
+            raise ValueError("At least one streaming regime weight must be positive")
+        if self.observation_delay_max_chunks < 0 or self.observation_delay_max_tokens < 0:
+            raise ValueError("observation delay limits must be non-negative")
+        if self.observation_delay_max_chunks and self.observation_delay_max_tokens:
+            raise ValueError("observation_delay_max_chunks and observation_delay_max_tokens cannot both be non-zero")
+        if (self.observation_delay_max_chunks or self.observation_delay_max_tokens) and not self.streaming:
+            raise ValueError("observation delay requires streaming=True")
+        if self.use_observation_delay_embedding or self.use_observation_delay_adarms:
+            if self.observation_delay_max_chunks == 0 and self.observation_delay_max_tokens == 0:
+                raise ValueError(
+                    "observation delay conditioning requires a non-zero observation delay limit"
+                )
+        if self.use_tactile_adarms and not self.use_tactile:
+            raise ValueError("use_tactile_adarms requires use_tactile=True")
+        if self.use_tactile_token and not self.use_tactile:
+            raise ValueError("use_tactile_token requires use_tactile=True")
+        if self.use_tactile_token_history and not self.use_tactile_token:
+            raise ValueError("use_tactile_token_history requires use_tactile_token=True")
+        if self.tactile_token_history_length <= 0:
+            raise ValueError("tactile_token_history_length must be positive")
+        if self.tactile_tcn_width <= 0:
+            raise ValueError("tactile_tcn_width must be positive")
+        if not math.isfinite(self.streaming_constant_weight) or not math.isfinite(self.streaming_chunk_wise_weight):
+            raise ValueError("streaming regime weights must be finite")
         if self.state_dim <= 0 or self.action_dim <= 0:
             raise ValueError(f"SmolVLA state_dim/action_dim must be positive, got {self.state_dim}/{self.action_dim}.")
         if self.n_action_steps > self.chunk_size:
@@ -133,7 +212,8 @@ class SmolVLAConfig(PreTrainedConfig):
             )
         if self.use_delta_joint_actions_aloha:
             raise NotImplementedError(
-                "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
+                "`use_delta_joint_actions_aloha` is used by SmolVLA for "
+                "Aloha real models. It is not ported yet in LeRobot."
             )
 
     def validate_features(self) -> None:
@@ -169,6 +249,25 @@ class SmolVLAConfig(PreTrainedConfig):
             )
             self.input_features[key] = empty_camera
 
+    def set_dataset_feature_metadata(self, features: dict[str, dict]) -> None:
+        """Use the fine-tuning dataset's state and real camera contracts.
+
+        A pretrained SmolVLA config already contains the base embodiment's
+        features (historically 6-D state and three 256x256 cameras). Keeping
+        those fields when fine-tuning another dataset makes the saved
+        checkpoint advertise the wrong runtime contract. The default policy
+        consumes ``observation.state`` and RGB images; when ``use_tactile`` is
+        enabled, tactile marker streams are retained as additional inputs.
+        """
+        policy_features = dataset_to_policy_features(features)
+        self.input_features = {
+            key: feature
+            for key, feature in policy_features.items()
+            if key == OBS_STATE
+            or feature.type is FeatureType.VISUAL
+            or (self.use_tactile and "tactile" in key.lower())
+        }
+
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
             lr=self.optimizer_lr,
@@ -189,7 +288,10 @@ class SmolVLAConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> list:
-        return [0]
+        # Training receives a contiguous current-to-past window. Runtime still
+        # accepts one current observation; delayed inference is represented by
+        # the age of the cached VLM prefix.
+        return list(range(-(self.n_obs_steps - 1), 1))
 
     @property
     def action_delta_indices(self) -> list:

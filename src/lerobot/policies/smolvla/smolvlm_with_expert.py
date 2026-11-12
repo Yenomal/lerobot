@@ -224,6 +224,7 @@ class SmolVLMWithExpertModel(nn.Module):
         layer_idx,
         position_ids,
         attention_mask,
+        attention_bias,
         batch_size,
         head_dim,
         use_cache: bool = True,
@@ -259,9 +260,11 @@ class SmolVLMWithExpertModel(nn.Module):
         if seq_len < position_ids.shape[1]:
             _position_ids = position_ids[:, :seq_len]
             _attention_mask = attention_mask[:, :seq_len, :seq_len]
+            _attention_bias = attention_bias[:, :seq_len, :seq_len] if attention_bias is not None else None
         else:
             _position_ids = position_ids
             _attention_mask = attention_mask
+            _attention_bias = attention_bias
 
         attention_mask_ = _attention_mask
         position_ids_ = _position_ids
@@ -287,7 +290,7 @@ class SmolVLMWithExpertModel(nn.Module):
         attention_interface = self.get_attention_interface()
 
         att_output = attention_interface(
-            attention_mask_, batch_size, head_dim, query_states, key_states, value_states
+            attention_mask_, batch_size, head_dim, query_states, key_states, value_states, _attention_bias
         )
         return [att_output], past_key_values
 
@@ -298,6 +301,7 @@ class SmolVLMWithExpertModel(nn.Module):
         layer_idx,
         position_ids,
         attention_mask,
+        attention_bias,
         batch_size,
         head_dim,
         use_cache: bool = True,
@@ -315,6 +319,9 @@ class SmolVLMWithExpertModel(nn.Module):
             seq_len = inputs_embeds[0].shape[1]
             position_id, expert_position_id = position_ids[:, :seq_len], position_ids[:, seq_len:]
             prefix_attention_mask = attention_mask[:, :seq_len, :seq_len]
+            prefix_attention_bias = (
+                attention_bias[:, :seq_len, :seq_len] if attention_bias is not None else None
+            )
 
             layer = model_layers[0][layer_idx]
 
@@ -333,7 +340,13 @@ class SmolVLMWithExpertModel(nn.Module):
             key_states = apply_rope(key_state, position_id)
 
             att_output = attention_interface(
-                prefix_attention_mask, batch_size, head_dim, query_states, key_states, value_states
+                prefix_attention_mask,
+                batch_size,
+                head_dim,
+                query_states,
+                key_states,
+                value_states,
+                prefix_attention_bias,
             )
             att_outputs.append(att_output)
         else:
@@ -379,6 +392,11 @@ class SmolVLMWithExpertModel(nn.Module):
             expert_attention_mask = attention_mask[
                 :, -inputs_embeds[1].shape[1] :, : expert_key_states.shape[1] :
             ]  # take into account kv
+            expert_attention_bias = (
+                attention_bias[:, -inputs_embeds[1].shape[1] :, : expert_key_states.shape[1] :]
+                if attention_bias is not None
+                else None
+            )
 
             expert_query_states = apply_rope(expert_query_state, expert_position_id)
 
@@ -389,6 +407,7 @@ class SmolVLMWithExpertModel(nn.Module):
                 expert_query_states,
                 expert_key_states,
                 expert_value_states,
+                expert_attention_bias,
             )
             att_outputs.append(att_output)
         else:
@@ -418,6 +437,7 @@ class SmolVLMWithExpertModel(nn.Module):
         past_key_values: "DynamicCache | None" = None,
         inputs_embeds: list[torch.Tensor | None] | None = None,
         use_cache: bool | None = None,
+        attention_bias: torch.Tensor | None = None,
     ):
         if inputs_embeds is None:
             raise ValueError(
@@ -457,6 +477,7 @@ class SmolVLMWithExpertModel(nn.Module):
                     layer_idx,
                     position_ids,
                     attention_mask,
+                    attention_bias,
                     batch_size,
                     head_dim,
                     use_cache=use_cache,
@@ -469,6 +490,7 @@ class SmolVLMWithExpertModel(nn.Module):
                     layer_idx,
                     position_ids,
                     attention_mask,
+                    attention_bias,
                     batch_size,
                     head_dim,
                     use_cache=use_cache,
@@ -523,7 +545,14 @@ class SmolVLMWithExpertModel(nn.Module):
         return attention_interface
 
     def eager_attention_forward(
-        self, attention_mask, batch_size, head_dim, query_states, key_states, value_states
+        self,
+        attention_mask,
+        batch_size,
+        head_dim,
+        query_states,
+        key_states,
+        value_states,
+        attention_bias=None,
     ):
         num_att_heads = self.num_attention_heads
         num_key_value_heads = self.num_key_value_heads
@@ -556,6 +585,8 @@ class SmolVLMWithExpertModel(nn.Module):
         att_weights *= head_dim**-0.5
 
         att_weights = att_weights.to(dtype=torch.float32)
+        if attention_bias is not None:
+            att_weights = att_weights + attention_bias[:, None, :, :].to(dtype=att_weights.dtype)
         big_neg = torch.finfo(att_weights.dtype).min  # -2.3819763e38  # See gemma/modules.py
         masked_att_weights = torch.where(attention_mask[:, None, :, :], att_weights, big_neg)
         probs = nn.functional.softmax(masked_att_weights, dim=-1)

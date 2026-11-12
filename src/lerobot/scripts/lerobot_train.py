@@ -99,6 +99,7 @@ from lerobot.utils.random_utils import set_seed
 from lerobot.utils.sample_weighting import SampleWeighter
 from lerobot.utils.utils import (
     cycle,
+    count_parameters,
     format_big_number,
     has_method,
     init_logging,
@@ -634,6 +635,10 @@ def train(cfg: TrainPipelineConfig) -> None:
             pretrained_path=resume_pretrained_dir,
         )
 
+    initialize_lazy_parameters = getattr(policy, "initialize_lazy_parameters", None)
+    if callable(initialize_lazy_parameters):
+        initialize_lazy_parameters()
+
     peft_model = None
     if cfg.peft is not None:
         if cfg.is_reward_model_training:
@@ -779,8 +784,8 @@ def train(cfg: TrainPipelineConfig) -> None:
     samples_per_step = cfg.batch_size * parallel_dims.dp_world_size
     effective_batch_size = samples_per_step * cfg.accelerator.gradient_accumulation.steps
     if is_main_process():
-        num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-        num_total_params = sum(p.numel() for p in policy.parameters())
+        num_learnable_params = count_parameters(policy.parameters(), trainable_only=True)
+        num_total_params = count_parameters(policy.parameters())
         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
         if cfg.env is not None:
             logging.info(f"{cfg.env.task=}")
