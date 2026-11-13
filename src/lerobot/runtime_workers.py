@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-from multiprocessing.connection import Connection
 from collections.abc import Mapping
+from multiprocessing.connection import Connection
+from threading import Lock
 from types import SimpleNamespace
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 import torch
 
 from lerobot.configs import PreTrainedConfig
-from lerobot.inference import ActionChunk, ActionProvenance, ObservationSnapshot, PolicyRunner
+from lerobot.inference import ActionChunk, ActionProvenance, ObservationSnapshot
 from lerobot.runtime_server import load_runtime_runner
 
 
@@ -78,6 +80,8 @@ def _decode_cache(value: Any, device: str) -> Any:
 
 def _worker_main(role: str, checkpoint: str, device: str, connection: Connection) -> None:
     runner = load_runtime_runner(checkpoint, device)
+    fm_cache_id: str | None = None
+    fm_cache: Any = None
     try:
         connection.send({"ready": role})
         while True:
@@ -88,6 +92,8 @@ def _worker_main(role: str, checkpoint: str, device: str, connection: Connection
                 return
             if op == "reset":
                 runner.reset(full=True)
+                fm_cache_id = None
+                fm_cache = None
                 connection.send({"ok": True})
                 continue
             if role == "vlm" and op == "encode_prefix":
@@ -101,8 +107,12 @@ def _worker_main(role: str, checkpoint: str, device: str, connection: Connection
                 connection.send({"prepared": _cpu_tree(prepared), "cache": _encode_cache(cache)})
                 continue
             if role == "fm" and op == "predict_from_prefix":
-                cache = _decode_cache(request["cache"], device)
-                prepared = _decode_cache(request["prepared"], device)
+                cache_id = request["cache_id"]
+                if "cache" in request:
+                    fm_cache = _decode_cache(request["cache"], device)
+                    fm_cache_id = cache_id
+                elif fm_cache_id is None or cache_id != fm_cache_id:
+                    raise ValueError("FM prefix cache is not loaded; submit the cache before reusing its ID")
                 observation = ObservationSnapshot(
                     request["features"],
                     0.0,
@@ -110,11 +120,12 @@ def _worker_main(role: str, checkpoint: str, device: str, connection: Connection
                     observation_id=str(request["sequence"]),
                 )
                 result = runner.predict_from_prefix(
-                    prepared,
-                    cache,
+                    {},
+                    fm_cache,
                     observation=observation,
                     inference_mode=request["inference_mode"],
                     context_cfg_lambda=float(request["context_cfg_lambda"]),
+                    tactile_cfg_lambda=float(request["tactile_cfg_lambda"]),
                     observation_delay_tokens=request.get("observation_delay_tokens"),
                     observation_delay_chunks=request.get("observation_delay_chunks"),
                 )
@@ -143,6 +154,9 @@ class ProcessStreamingRunner:
             raise ValueError("checkpoint is required")
         self.config = PreTrainedConfig.from_pretrained(resolved)
         self.policy = SimpleNamespace(config=self.config)
+        self._vlm_lock = Lock()
+        self._fm_prefix_cache: Any = None
+        self._fm_prefix_id: str | None = None
         context = mp.get_context("spawn")
         self._vlm_parent, vlm_child = context.Pipe()
         self._fm_parent, fm_child = context.Pipe()
@@ -167,15 +181,18 @@ class ProcessStreamingRunner:
                 raise RuntimeError(f"Unexpected {role.upper()} worker startup response: {ready!r}")
 
     def encode_prefix(self, observation: ObservationSnapshot):
-        self._vlm_parent.send(
-            {
-                "op": "encode_prefix",
-                "features": dict(observation.features),
-                "task": observation.task,
-                "sequence": observation.observation_id,
-            }
-        )
-        result = self._vlm_parent.recv()
+        # A background refresh and a foreground reset must not receive each
+        # other's replies from the same pipe.
+        with self._vlm_lock:
+            self._vlm_parent.send(
+                {
+                    "op": "encode_prefix",
+                    "features": dict(observation.features),
+                    "task": observation.task,
+                    "sequence": observation.observation_id,
+                }
+            )
+            result = self._vlm_parent.recv()
         if "error" in result:
             raise RuntimeError(result["error"])
         return result["prepared"], result["cache"]
@@ -190,6 +207,7 @@ class ProcessStreamingRunner:
             observation=observation,
             inference_mode=kwargs.get("inference_mode", "stream"),
             context_cfg_lambda=float(kwargs.get("context_cfg_lambda", 0.1)),
+            tactile_cfg_lambda=float(kwargs.get("tactile_cfg_lambda", 1.5)),
         )
 
     def predict_from_prefix(
@@ -200,26 +218,37 @@ class ProcessStreamingRunner:
         observation: ObservationSnapshot,
         inference_mode: str,
         context_cfg_lambda: float,
+        tactile_cfg_lambda: float = 1.5,
         observation_delay_tokens: int | None = None,
         observation_delay_chunks: int | None = None,
     ) -> ActionChunk:
-        self._fm_parent.send(
-            {
-                "op": "predict_from_prefix",
-                "prepared": prepared,
-                "cache": prefix_cache,
-                "features": dict(observation.features),
-                "task": observation.task,
-                "sequence": observation.observation_id,
-                "inference_mode": inference_mode,
-                "context_cfg_lambda": context_cfg_lambda,
-                "observation_delay_tokens": observation_delay_tokens,
-                "observation_delay_chunks": observation_delay_chunks,
-            }
-        )
+        # PolicyRunner prepares the current observation on the FM side. The
+        # VLM's prepared batch is unused here and need not cross this pipe.
+        del prepared
+        new_prefix = self._fm_prefix_id is None or prefix_cache is not self._fm_prefix_cache
+        cache_id = uuid4().hex if new_prefix else self._fm_prefix_id
+        request = {
+            "op": "predict_from_prefix",
+            "cache_id": cache_id,
+            "features": dict(observation.features),
+            "task": observation.task,
+            "sequence": observation.observation_id,
+            "inference_mode": inference_mode,
+            "context_cfg_lambda": context_cfg_lambda,
+            "tactile_cfg_lambda": tactile_cfg_lambda,
+            "observation_delay_tokens": observation_delay_tokens,
+            "observation_delay_chunks": observation_delay_chunks,
+        }
+        if new_prefix:
+            request["cache"] = prefix_cache
+        self._fm_parent.send(request)
         result = self._fm_parent.recv()
         if "error" in result:
             raise RuntimeError(result["error"])
+        # Retain the object, not just id(object), so Python cannot recycle its
+        # identity while the worker still has the corresponding GPU prefix.
+        self._fm_prefix_cache = prefix_cache
+        self._fm_prefix_id = cache_id
         actions = torch.from_numpy(np.asarray(result["actions"], dtype=np.float32))
         return ActionChunk(
             model_actions=None,
@@ -235,24 +264,30 @@ class ProcessStreamingRunner:
 
     def reset(self, *, full: bool = True) -> None:
         del full
-        for connection in (self._vlm_parent, self._fm_parent):
-            try:
-                connection.send({"op": "reset"})
-            except (BrokenPipeError, EOFError, OSError):
-                continue
-        for connection in (self._vlm_parent, self._fm_parent):
-            try:
-                connection.recv()
-            except (BrokenPipeError, EOFError, OSError):
-                continue
+        self._fm_prefix_cache = None
+        self._fm_prefix_id = None
+        with self._vlm_lock:
+            for connection in (self._vlm_parent, self._fm_parent):
+                try:
+                    connection.send({"op": "reset"})
+                except (BrokenPipeError, EOFError, OSError):
+                    continue
+            for connection in (self._vlm_parent, self._fm_parent):
+                try:
+                    connection.recv()
+                except (BrokenPipeError, EOFError, OSError):
+                    continue
 
     def close(self) -> None:
-        for connection in (self._vlm_parent, self._fm_parent):
-            try:
-                connection.send({"op": "close"})
-                connection.recv()
-            except (BrokenPipeError, EOFError, OSError):
-                pass
+        self._fm_prefix_cache = None
+        self._fm_prefix_id = None
+        with self._vlm_lock:
+            for connection in (self._vlm_parent, self._fm_parent):
+                try:
+                    connection.send({"op": "close"})
+                    connection.recv()
+                except (BrokenPipeError, EOFError, OSError):
+                    pass
         for process in (self._vlm_process, self._fm_process):
             process.join(timeout=5)
             if process.is_alive():

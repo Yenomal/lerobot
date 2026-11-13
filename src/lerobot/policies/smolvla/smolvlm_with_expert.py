@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
+from torch.nn import functional as F  # noqa: N812
 
 from lerobot.utils.import_utils import _transformers_available, require_package
 
@@ -71,6 +72,80 @@ def get_intermediate_size(hidden_dim, ffn_dim_multiplier=4, multiple_of=256):
     return hidden_dim
 
 
+class AdaptiveRMSNormModulation(nn.Module):
+    """Apply condition-dependent scale and shift after an existing RMSNorm."""
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.projection = nn.Linear(hidden_size, 2 * hidden_size)
+        # Start with the original expert behavior when adding delay conditioning.
+        nn.init.zeros_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
+
+    def forward(self, normalized: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        scale, shift = (
+            self.projection(condition.to(self.projection.weight.dtype)).to(normalized.dtype).chunk(2, dim=-1)
+        )
+        if scale.ndim == 2:
+            scale, shift = scale[:, None, :], shift[:, None, :]
+        return normalized * (1 + scale) + shift
+
+
+class AdaptiveRMSNormZeroModulation(nn.Module):
+    """Zero-initialized scale/shift/gate applied after the existing pretrained RMSNorm."""
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.projection = nn.Linear(hidden_size, 3 * hidden_size)
+        nn.init.zeros_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
+
+    def forward(self, normalized: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        modulation = self.projection(F.silu(condition.to(self.projection.weight.dtype)))
+        scale, shift, _ = modulation.to(normalized.dtype).chunk(3, dim=-1)
+        if scale.ndim == 2:
+            scale, shift = scale[:, None, :], shift[:, None, :]
+        return normalized * (1 + scale) + shift
+
+    def gate(self, residual: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        # Compute only the gate rows, without retaining per-call state on the module.
+        width = residual.shape[-1]
+        gate = F.linear(
+            F.silu(condition.to(self.projection.weight.dtype)),
+            self.projection.weight[2 * width :],
+            self.projection.bias[2 * width :],
+        ).to(residual.dtype)
+        return residual * (gate[:, None, :] if gate.ndim == 2 else gate)
+
+
+class FlowTimeRMSNorm(nn.Module):
+    """Pi0.5 AdaRMS: unweighted RMS normalization and a linear time modulation."""
+
+    def __init__(self, hidden_size: int, *, residual_gate: bool = True) -> None:
+        super().__init__()
+        # The reference final norm discards gate; omit its unused projection rows.
+        self.projection = nn.Linear(hidden_size, (3 if residual_gate else 2) * hidden_size)
+        nn.init.zeros_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
+
+    def forward(self, hidden_states: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        x = hidden_states.float()
+        normalized = x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + 1e-6)
+        modulation = self.projection(condition.to(self.projection.weight.dtype))
+        if modulation.ndim == 2:
+            modulation = modulation[:, None, :]
+        width = hidden_states.shape[-1]
+        scale, shift = modulation[..., : 2 * width].float().chunk(2, dim=-1)
+        return (normalized * (1 + scale) + shift).to(hidden_states.dtype)
+
+    def gate(self, residual: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        width = residual.shape[-1]
+        gate = self.projection(condition.to(self.projection.weight.dtype))[..., 2 * width :].to(
+            residual.dtype
+        )
+        return residual * (gate[:, None, :] if gate.ndim == 2 else gate)
+
+
 class SmolVLMWithExpertModel(nn.Module):
     def __init__(
         self,
@@ -84,6 +159,9 @@ class SmolVLMWithExpertModel(nn.Module):
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
         device: str = "auto",
+        use_observation_delay_adarms: bool = False,
+        use_observation_delay_adaln_zero: bool = False,
+        use_noise_adarms: bool = False,
     ):
         super().__init__()
         require_package("transformers", extra="smolvla")
@@ -116,6 +194,35 @@ class SmolVLMWithExpertModel(nn.Module):
             )
             lm_expert_config.num_hidden_layers = num_expert_layers
         self.lm_expert = AutoModel.from_config(lm_expert_config)
+
+        if use_noise_adarms:
+            for layer in self.lm_expert.layers:
+                layer.noise_adarms = nn.ModuleDict(
+                    {branch: FlowTimeRMSNorm(lm_expert_config.hidden_size) for branch in ("attention", "mlp")}
+                )
+                # Reference AdaRMS replaces the learned static norm scale.
+                layer.input_layernorm.requires_grad_(False)
+                layer.post_attention_layernorm.requires_grad_(False)
+            self.lm_expert.noise_adarms = FlowTimeRMSNorm(lm_expert_config.hidden_size, residual_gate=False)
+            self.lm_expert.norm.requires_grad_(False)
+
+        if use_observation_delay_adarms and not use_noise_adarms:
+            for layer in self.lm_expert.layers:
+                layer.observation_delay_adarms = nn.ModuleDict(
+                    {
+                        "attention": AdaptiveRMSNormModulation(lm_expert_config.hidden_size),
+                        "mlp": AdaptiveRMSNormModulation(lm_expert_config.hidden_size),
+                    }
+                )
+
+        if use_observation_delay_adaln_zero and not use_noise_adarms:
+            for layer in self.lm_expert.layers:
+                layer.observation_delay_adaln_zero = nn.ModuleDict(
+                    {
+                        "attention": AdaptiveRMSNormZeroModulation(lm_expert_config.hidden_size),
+                        "mlp": AdaptiveRMSNormZeroModulation(lm_expert_config.hidden_size),
+                    }
+                )
 
         self.num_expert_layers = len(self.lm_expert.layers)
         self.self_attn_every_n_layers = self_attn_every_n_layers
@@ -217,6 +324,65 @@ class SmolVLMWithExpertModel(nn.Module):
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.get_vlm_model().text_model.get_input_embeddings()(tokens)
 
+    @staticmethod
+    def _merge_noise_condition(
+        noise_condition: torch.Tensor, delay_condition: torch.Tensor | None
+    ) -> torch.Tensor:
+        if delay_condition is None:
+            return noise_condition
+        if noise_condition.ndim == 3 and delay_condition.ndim == 2:
+            delay_condition = delay_condition[:, None, :]
+        return noise_condition + delay_condition
+
+    @staticmethod
+    def _conditioned_norm(
+        layer: nn.Module,
+        hidden_states: torch.Tensor,
+        condition: torch.Tensor | None,
+        branch: str,
+        noise_condition: torch.Tensor | None = None,
+        delay_modulation_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        norm = layer.input_layernorm if branch == "attention" else layer.post_attention_layernorm
+        if noise_condition is not None:
+            combined = SmolVLMWithExpertModel._merge_noise_condition(noise_condition, condition)
+            return layer.noise_adarms[branch](hidden_states, combined)
+        normalized = norm(hidden_states)
+        if condition is not None:
+            modulations = (
+                layer.observation_delay_adaln_zero
+                if hasattr(layer, "observation_delay_adaln_zero")
+                else layer.observation_delay_adarms
+            )
+            modulated = modulations[branch](normalized, condition)
+            normalized = (
+                torch.where(delay_modulation_mask[:, None, None], modulated, normalized)
+                if delay_modulation_mask is not None
+                else modulated
+            )
+        return normalized
+
+    @staticmethod
+    def _conditioned_residual(
+        layer: nn.Module,
+        residual: torch.Tensor,
+        condition: torch.Tensor | None,
+        branch: str,
+        noise_condition: torch.Tensor | None = None,
+        delay_modulation_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if noise_condition is not None:
+            combined = SmolVLMWithExpertModel._merge_noise_condition(noise_condition, condition)
+            return layer.noise_adarms[branch].gate(residual, combined)
+        if condition is not None and hasattr(layer, "observation_delay_adaln_zero"):
+            gated = layer.observation_delay_adaln_zero[branch].gate(residual, condition)
+            return (
+                torch.where(delay_modulation_mask[:, None, None], gated, residual)
+                if delay_modulation_mask is not None
+                else gated
+            )
+        return residual
+
     def forward_attn_layer(
         self,
         model_layers,
@@ -229,6 +395,9 @@ class SmolVLMWithExpertModel(nn.Module):
         head_dim,
         use_cache: bool = True,
         past_key_values: "DynamicCache | None" = None,
+        expert_condition: torch.Tensor | None = None,
+        noise_condition: torch.Tensor | None = None,
+        delay_modulation_mask: torch.Tensor | None = None,
     ) -> "tuple[list[torch.Tensor], DynamicCache | None]":
         query_states = []
         key_states = []
@@ -237,7 +406,14 @@ class SmolVLMWithExpertModel(nn.Module):
             layer = model_layers[i][layer_idx]
             if hidden_states is None or layer is None:
                 continue
-            hidden_states = layer.input_layernorm(hidden_states)
+            hidden_states = self._conditioned_norm(
+                layer,
+                hidden_states,
+                expert_condition if i == 1 else None,
+                "attention",
+                noise_condition if i == 1 else None,
+                delay_modulation_mask if i == 1 else None,
+            )
 
             input_shape = hidden_states.shape[:-1]
             hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
@@ -306,6 +482,9 @@ class SmolVLMWithExpertModel(nn.Module):
         head_dim,
         use_cache: bool = True,
         past_key_values: "DynamicCache | None" = None,
+        expert_condition: torch.Tensor | None = None,
+        noise_condition: torch.Tensor | None = None,
+        delay_modulation_mask: torch.Tensor | None = None,
     ) -> "tuple[list[torch.Tensor], DynamicCache | None]":
         attention_interface = self.get_attention_interface()
 
@@ -363,7 +542,14 @@ class SmolVLMWithExpertModel(nn.Module):
         # Expert
         expert_layer = model_layers[1][layer_idx]
         if expert_layer is not None:
-            expert_hidden_states = expert_layer.input_layernorm(inputs_embeds[1])
+            expert_hidden_states = self._conditioned_norm(
+                expert_layer,
+                inputs_embeds[1],
+                expert_condition,
+                "attention",
+                noise_condition,
+                delay_modulation_mask,
+            )
 
             expert_input_shape = expert_hidden_states.shape[:-1]
             expert_hidden_shape = (*expert_input_shape, -1, expert_layer.self_attn.head_dim)
@@ -438,6 +624,9 @@ class SmolVLMWithExpertModel(nn.Module):
         inputs_embeds: list[torch.Tensor | None] | None = None,
         use_cache: bool | None = None,
         attention_bias: torch.Tensor | None = None,
+        expert_condition: torch.Tensor | None = None,
+        noise_condition: torch.Tensor | None = None,
+        delay_modulation_mask: torch.Tensor | None = None,
     ):
         if inputs_embeds is None:
             raise ValueError(
@@ -482,6 +671,9 @@ class SmolVLMWithExpertModel(nn.Module):
                     head_dim,
                     use_cache=use_cache,
                     past_key_values=past_key_values,
+                    expert_condition=expert_condition,
+                    noise_condition=noise_condition,
+                    delay_modulation_mask=delay_modulation_mask,
                 )
             else:
                 att_outputs, past_key_values = self.forward_cross_attn_layer(
@@ -495,6 +687,9 @@ class SmolVLMWithExpertModel(nn.Module):
                     head_dim,
                     use_cache=use_cache,
                     past_key_values=past_key_values,
+                    expert_condition=expert_condition,
+                    noise_condition=noise_condition,
+                    delay_modulation_mask=delay_modulation_mask,
                 )
             outputs_embeds = []
             start = 0
@@ -513,12 +708,37 @@ class SmolVLMWithExpertModel(nn.Module):
                         att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
                     att_out = att_output[:, start:end]
                     out_emb = layer.self_attn.o_proj(att_out)
+                    condition = expert_condition if i == 1 else None
+                    time_condition = noise_condition if i == 1 else None
+                    out_emb = self._conditioned_residual(
+                        layer,
+                        out_emb,
+                        condition,
+                        "attention",
+                        time_condition,
+                        delay_modulation_mask if i == 1 else None,
+                    )
 
                     out_emb += hidden_states
                     after_first_residual = out_emb.clone()
 
-                    out_emb = layer.post_attention_layernorm(out_emb)
+                    out_emb = self._conditioned_norm(
+                        layer,
+                        out_emb,
+                        condition,
+                        "mlp",
+                        time_condition,
+                        delay_modulation_mask if i == 1 else None,
+                    )
                     out_emb = layer.mlp(out_emb)
+                    out_emb = self._conditioned_residual(
+                        layer,
+                        out_emb,
+                        condition,
+                        "mlp",
+                        time_condition,
+                        delay_modulation_mask if i == 1 else None,
+                    )
 
                     out_emb += after_first_residual
 
@@ -534,7 +754,13 @@ class SmolVLMWithExpertModel(nn.Module):
         outputs_embeds = []
         for i, hidden_states in enumerate(inputs_embeds):
             if hidden_states is not None:
-                out_emb = models[i].norm(hidden_states)
+                out_emb = (
+                    self.lm_expert.noise_adarms(
+                        hidden_states, self._merge_noise_condition(noise_condition, expert_condition)
+                    )
+                    if i == 1 and noise_condition is not None
+                    else models[i].norm(hidden_states)
+                )
                 outputs_embeds.append(out_emb)
             else:
                 outputs_embeds.append(None)

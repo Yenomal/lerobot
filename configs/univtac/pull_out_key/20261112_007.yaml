@@ -1,0 +1,15 @@
+schema_version: 1
+extends: base.yaml
+
+exp_name: "20261112_007"
+scripts: "delay AdaRMSNorm-Zero with zero residual gates"
+
+policy:
+  n_obs_steps: 21
+  streaming: true
+  streaming_attention_mode: random_gate
+  observation_delay_max_tokens: 20
+  use_observation_delay_adarms: false
+  use_observation_delay_adaln_zero: true
+  observation_delay_zero_bypass: true
+  use_observation_delay_sincos: false

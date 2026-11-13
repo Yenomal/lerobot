@@ -7,6 +7,7 @@ scripts: "streaming with delay token 20 and random gate, tactile token mode"
 policy:
   streaming: true
   streaming_attention_mode: random_gate
+  n_obs_steps: 21
   observation_delay_max_tokens: 20
   use_observation_delay_embedding: false
   use_observation_delay_adarms: false

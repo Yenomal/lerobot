@@ -59,9 +59,9 @@ from typing import Any, Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
-from torch import Tensor, nn
 from safetensors import safe_open
 from safetensors.torch import load_file
+from torch import Tensor, nn
 
 from lerobot.configs import FeatureType
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
@@ -221,8 +221,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         with safe_open(model_file, framework="pt", device="cpu") as checkpoint_file:
             mismatched_keys = [
                 key
-                for key in checkpoint_file.keys()
-                if key in own_state and tuple(checkpoint_file.get_slice(key).get_shape()) != tuple(own_state[key].shape)
+                for key in checkpoint_file.keys()  # noqa: SIM118 -- safe_open is not an iterable mapping.
+                if key in own_state
+                and tuple(checkpoint_file.get_slice(key).get_shape()) != tuple(own_state[key].shape)
             ]
         if not mismatched_keys:
             return super()._load_as_safetensor(model, model_file, map_location, strict)
@@ -395,6 +396,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
         """Run only FM denoising against a previously encoded VLM prefix."""
         self.eval()
         batch = self._prepare_batch(batch)
+        # Runtime refreshes cache age in the current FM batch. Forward it
+        # explicitly instead of falling back to the age stored at VLM prefill.
+        for key in ("observation_delay_tokens", "observation_delay_chunks"):
+            if key in batch and key not in kwargs:
+                kwargs[key] = batch[key]
         actions = self.model.sample_actions_from_prefix(
             prefix_cache,
             noise=noise,
@@ -452,11 +458,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             delay = batch[key].to(device=batch[OBS_STATE].device, dtype=torch.long)
             if delay.ndim > 1:
                 delay = delay[:, -1]
-            delay_step = (
-                self.config.streaming_chunk_size
-                if self.config.observation_delay_max_chunks
-                else 1
-            )
+            delay_step = self.config.streaming_chunk_size if self.config.observation_delay_max_chunks else 1
             delay = delay * delay_step
             state = batch[OBS_STATE]
             if state.ndim == 3:
@@ -479,9 +481,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                     (
                         key
                         for key in batch
-                        if "tactile" in key.lower()
-                        and side in key.lower()
-                        and "history" not in key.lower()
+                        if "tactile" in key.lower() and side in key.lower() and "history" not in key.lower()
                     ),
                     None,
                 )
@@ -583,9 +583,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         # policy path before constructing model inputs. Without this call,
         # observation_delay_max_* only existed in the inference helper and had
         # no effect on training batches.
-        batch = self._prepare_batch(
-            batch, update_tactile_history=False, delay_mask=delay_mask
-        )
+        batch = self._prepare_batch(batch, update_tactile_history=False, delay_mask=delay_mask)
         if self.config.adapt_to_pi_aloha:
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
@@ -778,14 +776,27 @@ class SmolVLAPolicy(PreTrainedPolicy):
         """Return default PEFT target modules for SmolVLA fine-tuning."""
         common_projections = (
             "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out|"
-            "observation_delay_embedding|observation_delay_adarms|tactile_encoder|tactile_adarms|"
+            "observation_delay_embedding|observation_delay_adarms|observation_delay_adaln_zero|"
+            "observation_delay_token_embedding|"
+            "tactile_encoder|tactile_adarms|"
             "tactile_token_proj|tactile_token_tcn_in|tactile_token_tcn_1|"
             "tactile_token_tcn_2|tactile_token_out"
         )
+        if self.config.use_noise_adarms and not self.config.use_noise_embedding:
+            common_projections = common_projections.replace("action_time_mlp_in|action_time_mlp_out|", "")
         target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
+        modules_to_save = []
+        if self.config.use_noise_adarms:
+            # New zero-initialized modulation weights must train in full under PEFT.
+            modules_to_save = [
+                name
+                for name, module in self.named_modules()
+                if isinstance(module, nn.Linear)
+                and (".noise_adarms." in name or name in ("model.time_mlp_in", "model.time_mlp_out"))
+            ]
         return {
             "target_modules": target_modules,
-            "modules_to_save": [],
+            "modules_to_save": modules_to_save,
         }
 
     def _validate_peft_config(self, peft_config) -> None:
@@ -864,6 +875,9 @@ class VLAFlowMatching(nn.Module):
             self_attn_every_n_layers=self.config.self_attn_every_n_layers,
             expert_width_multiplier=self.config.expert_width_multiplier,
             device=self.config.device if self.config.device is not None else "auto",
+            use_observation_delay_adarms=self.config.use_observation_delay_adarms,
+            use_observation_delay_adaln_zero=self.config.use_observation_delay_adaln_zero,
+            use_noise_adarms=self.config.use_noise_adarms,
         )
         # The pretrained SmolVLM loader uses bfloat16 weights by default, while
         # the action expert and auxiliary projections are initialized in float32.
@@ -883,23 +897,51 @@ class VLAFlowMatching(nn.Module):
         self.action_time_mlp_out = nn.Linear(
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
+        if self.config.use_noise_adarms:
+            width = self.vlm_with_expert.expert_hidden_size
+            self.time_mlp_in = nn.Linear(width, width)
+            self.time_mlp_out = nn.Linear(width, width)
+            if not self.config.use_noise_embedding:
+                self.action_time_mlp_in.requires_grad_(False)
+                self.action_time_mlp_out.requires_grad_(False)
 
         self._delay_max = max(
             self.config.observation_delay_max_chunks,
             self.config.observation_delay_max_tokens,
         )
+        delay_width = self.vlm_with_expert.expert_hidden_size
+
+        def delay_encoder() -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(delay_width, delay_width), nn.SiLU(), nn.Linear(delay_width, delay_width)
+            )
+
         self.observation_delay_embedding = (
-            nn.Embedding(self._delay_max + 1, self.vlm_with_expert.expert_hidden_size)
+            (
+                delay_encoder()
+                if self.config.use_observation_delay_sincos
+                else nn.Embedding(self._delay_max + 1, delay_width)
+            )
             if self.config.use_observation_delay_embedding and self._delay_max > 0
             else None
         )
         self.observation_delay_adarms = (
             nn.Sequential(
-                nn.Linear(1, self.vlm_with_expert.expert_hidden_size),
+                nn.Linear(delay_width if self.config.use_observation_delay_sincos else 1, delay_width),
                 nn.SiLU(),
                 nn.Linear(self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size),
             )
-            if self.config.use_observation_delay_adarms and self._delay_max > 0
+            if (self.config.use_observation_delay_adarms or self.config.use_observation_delay_adaln_zero)
+            and self._delay_max > 0
+            else None
+        )
+        self.observation_delay_token_embedding = (
+            (
+                delay_encoder()
+                if self.config.use_observation_delay_sincos
+                else nn.Embedding(self._delay_max + 1, delay_width)
+            )
+            if self.config.use_observation_delay_token and self._delay_max > 0
             else None
         )
         if self.config.use_tactile:
@@ -922,12 +964,8 @@ class VLAFlowMatching(nn.Module):
                 self.tactile_token_tcn_in = nn.Linear(
                     self.vlm_with_expert.expert_hidden_size, self.tactile_tcn_width
                 )
-                self.tactile_token_tcn_1 = nn.Linear(
-                    3 * self.tactile_tcn_width, self.tactile_tcn_width
-                )
-                self.tactile_token_tcn_2 = nn.Linear(
-                    3 * self.tactile_tcn_width, self.tactile_tcn_width
-                )
+                self.tactile_token_tcn_1 = nn.Linear(3 * self.tactile_tcn_width, self.tactile_tcn_width)
+                self.tactile_token_tcn_2 = nn.Linear(3 * self.tactile_tcn_width, self.tactile_tcn_width)
                 self.tactile_token_out = nn.Linear(
                     self.tactile_tcn_width, self.vlm_with_expert.expert_hidden_size
                 )
@@ -941,7 +979,9 @@ class VLAFlowMatching(nn.Module):
                 nn.Sequential(
                     nn.Linear(tactile_hidden, self.vlm_with_expert.expert_hidden_size),
                     nn.SiLU(),
-                    nn.Linear(self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size),
+                    nn.Linear(
+                        self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
+                    ),
                 )
                 if self.config.use_tactile_adarms
                 else None
@@ -993,6 +1033,23 @@ class VLAFlowMatching(nn.Module):
         if delay.ndim > 1:
             delay = delay[:, -1]
         return delay.to(device=device, dtype=torch.long).clamp(0, self._delay_max)
+
+    def _delay_position_encoding(self, delay: Tensor, action_count: int) -> Tensor:
+        """Transformer sin/cos features of action ages in control steps, without clipping d+i."""
+        if self.config.observation_delay_max_chunks:
+            delay = delay * self.config.streaming_chunk_size
+        positions = delay[:, None].float() + torch.arange(action_count, device=delay.device).float()[None, :]
+        width = self.vlm_with_expert.expert_hidden_size
+        frequencies = torch.exp(
+            -math.log(10_000.0) * torch.arange(0, width, 2, device=delay.device).float() / width
+        )
+        angles = positions[..., None] * frequencies
+        return torch.cat([angles.sin(), angles.cos()], dim=-1)[..., :width]
+
+    def _delay_token_count(self, action_count: int) -> int:
+        if self.observation_delay_token_embedding is None:
+            return 0
+        return action_count if getattr(self.config, "use_observation_delay_sincos", False) else 1
 
     def _find_tactile_key(self, batch, side: str, *, history: bool = False):
         names = list(self.config.tactile_feature_names)
@@ -1089,9 +1146,7 @@ class VLAFlowMatching(nn.Module):
             raise RuntimeError("Tactile encoder was not initialized")
         left, right = self._tactile_frame_values(batch)
         batch_size, history = left.shape[:2]
-        frame_tactile = torch.cat(
-            [left.flatten(start_dim=2), right.flatten(start_dim=2)], dim=-1
-        )
+        frame_tactile = torch.cat([left.flatten(start_dim=2), right.flatten(start_dim=2)], dim=-1)
         flattened = frame_tactile.reshape(batch_size * history, -1)
         first_layer = self.tactile_encoder[0]
         expected_width = getattr(first_layer, "in_features", None)
@@ -1161,7 +1216,9 @@ class VLAFlowMatching(nn.Module):
         """
         chunk_count = self.config.chunk_size // self.config.streaming_chunk_size
         epsilon = torch.finfo(torch.float32).tiny
-        gates = torch.empty(batch_size, chunk_count, device=device, dtype=torch.float32).uniform_(epsilon, math.e)
+        gates = torch.empty(batch_size, chunk_count, device=device, dtype=torch.float32).uniform_(
+            epsilon, math.e
+        )
         return gates.log().to(dtype=dtype)
 
     def _make_action_attention_bias(
@@ -1181,7 +1238,9 @@ class VLAFlowMatching(nn.Module):
         chunk_ids = torch.arange(action_count, device=log_gates.device) // chunk_size
         same_chunk = chunk_ids[:, None] == chunk_ids[None, :]
         query_gate = log_gates[:, chunk_ids]
-        action_bias = torch.where(same_chunk[None], torch.zeros_like(query_gate[:, :, None]), query_gate[:, :, None])
+        action_bias = torch.where(
+            same_chunk[None], torch.zeros_like(query_gate[:, :, None]), query_gate[:, :, None]
+        )
         bias = torch.zeros(
             log_gates.shape[0], query_length, key_length, device=log_gates.device, dtype=log_gates.dtype
         )
@@ -1199,19 +1258,24 @@ class VLAFlowMatching(nn.Module):
         prefix_len: int,
         action_count: int,
         query_offset: int = 0,
+        delay_token: int = 0,
     ) -> Tensor:
         """Apply Pi05's isolated ``T, CA0, A0`` visibility rule."""
         if action_count < 1:
             raise ValueError("tactile token masking requires at least one action")
-        tactile_index = prefix_len
-        copy_action_index = prefix_len + 1
-        action0_index = prefix_len + 2
+        special_offset = int(delay_token)
+        tactile_index = prefix_len + special_offset
+        copy_action_index = tactile_index + 1
+        action0_index = tactile_index + 2
         if attention_mask.shape[-1] < action0_index + action_count:
             raise ValueError("attention mask is shorter than the tactile-token suffix")
         tactile_query_index = tactile_index - query_offset
         copy_query_index = copy_action_index - query_offset
         action0_query_index = action0_index - query_offset
-        if not 0 <= tactile_query_index < attention_mask.shape[1] or not 0 <= action0_query_index < attention_mask.shape[1]:
+        if (
+            not 0 <= tactile_query_index < attention_mask.shape[1]
+            or not 0 <= action0_query_index < attention_mask.shape[1]
+        ):
             raise ValueError("attention mask query rows do not cover the tactile-token suffix")
 
         masked = attention_mask.clone()
@@ -1234,11 +1298,57 @@ class VLAFlowMatching(nn.Module):
         masked[:, copy_query_index, :prefix_len] = copy_prefix
         masked[:, copy_query_index, tactile_index] = True
         masked[:, copy_query_index, copy_action_index] = True
+        if delay_token:
+            masked[:, copy_query_index, prefix_len] = True
 
         # A0 reads prefix + its own key, but neither T nor CA0.
         masked[:, action0_query_index, :] = False
         masked[:, action0_query_index, :prefix_len] = action0_prefix
+        if delay_token:
+            # A0 consumes D0 in both shared and per-action delay layouts.
+            # The tactile token keeps its isolated visibility.
+            masked[:, action0_query_index, prefix_len] = True
         masked[:, action0_query_index, action0_index] = True
+        return masked
+
+    @staticmethod
+    def _apply_delay_token_mask(
+        attention_mask: Tensor,
+        *,
+        prefix_len: int,
+        action_count: int,
+        action_start_offset: int = 1,
+        query_offset: int = 0,
+        delay_token_count: int = 1,
+    ) -> Tensor:
+        """Delay tokens read prefix+self; each action reads its own delay (or the legacy shared one)."""
+        delay_index = prefix_len
+        action_start = prefix_len + action_start_offset
+        delay_query = delay_index - query_offset
+        if (
+            action_count < 1
+            or delay_token_count not in (1, action_count)
+            or action_start_offset < delay_token_count
+            or attention_mask.shape[-1] < action_start + action_count
+        ):
+            raise ValueError("invalid delay-token suffix")
+        if not 0 <= delay_query < delay_query + delay_token_count <= attention_mask.shape[1]:
+            raise ValueError("attention mask query rows do not cover delay token")
+        masked = attention_mask.clone()
+        masked[:, :, delay_index : delay_index + delay_token_count] = False
+        delay_queries = slice(delay_query, delay_query + delay_token_count)
+        prefix = masked[:, delay_queries, :prefix_len].clone()
+        masked[:, delay_queries, :] = False
+        masked[:, delay_queries, :prefix_len] = prefix
+        indices = torch.arange(delay_token_count, device=masked.device)
+        masked[:, delay_query + indices, delay_index + indices] = True
+        q0 = action_start - query_offset
+        if q0 < 0 or q0 + action_count > masked.shape[1]:
+            raise ValueError("attention mask query rows do not cover the actions")
+        if delay_token_count == 1:
+            masked[:, q0 : q0 + action_count, delay_index] = True
+        else:
+            masked[:, q0 + indices, delay_index + indices] = True
         return masked
 
     @staticmethod
@@ -1375,13 +1485,6 @@ class VLAFlowMatching(nn.Module):
 
         # Set attention masks so that image and language inputs do not attend to state or actions
         att_masks += [1] * (states_seq_len)
-        delay = self._delay_tensor(
-            observation_delay_chunks,
-            observation_delay_tokens,
-            batch_size=bsize,
-            device=device,
-        )
-
         # Tactile tokens are FM-side conditions. They are deliberately kept
         # out of the reusable VLM prefix so a new observation can refresh the
         # token without invalidating the visual/language cache.
@@ -1419,25 +1522,30 @@ class VLAFlowMatching(nn.Module):
         device = action_emb.device
         bsize = action_emb.shape[0]
         dtype = action_emb.dtype
-        # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
-        time_emb = create_sinusoidal_pos_embedding(
-            timestep,
-            self.vlm_with_expert.expert_hidden_size,
-            self.config.min_period,
-            self.config.max_period,
-            device=device,
-        )
-        time_emb = time_emb.type(dtype=dtype)
-
-        if time_emb.ndim == 2:
-            time_emb = time_emb[:, None, :].expand_as(action_emb)
-        elif time_emb.shape[:2] != action_emb.shape[:2]:
-            time_emb = time_emb[:, : action_emb.shape[1], :]
-        action_time_emb = torch.cat([action_emb, time_emb], dim=2)
-
-        action_time_emb = self.action_time_mlp_in(action_time_emb)
-        action_time_emb = F.silu(action_time_emb)  # swish == silu
-        action_time_emb = self.action_time_mlp_out(action_time_emb)
+        if self.config.use_noise_embedding:
+            # Encode the noise level independently of observation-delay conditioning.
+            time_emb = create_sinusoidal_pos_embedding(
+                timestep,
+                self.vlm_with_expert.expert_hidden_size,
+                self.config.min_period,
+                self.config.max_period,
+                device=device,
+            ).to(dtype=dtype)
+            if time_emb.ndim == 2:
+                time_emb = time_emb[:, None, :].expand_as(action_emb)
+            elif time_emb.shape[:2] != action_emb.shape[:2]:
+                time_emb = time_emb[:, : action_emb.shape[1], :]
+        else:
+            # Keep the MLP/checkpoint shapes while removing explicit timestep information.
+            time_emb = torch.zeros_like(action_emb)
+        if getattr(self.config, "use_noise_adarms", False) and not self.config.use_noise_embedding:
+            # Pi0.5 keeps time out of action tokens; it only conditions the norms.
+            action_time_emb = action_emb
+        else:
+            action_time_emb = torch.cat([action_emb, time_emb], dim=2)
+            action_time_emb = self.action_time_mlp_in(action_time_emb)
+            action_time_emb = F.silu(action_time_emb)  # swish == silu
+            action_time_emb = self.action_time_mlp_out(action_time_emb)
 
         delay = self._delay_tensor(
             observation_delay_chunks,
@@ -1450,15 +1558,17 @@ class VLAFlowMatching(nn.Module):
         # prefix so a lagging prefix can be paired with the current cache-age
         # value on every action-expert invocation.
         if self.observation_delay_embedding is not None:
-            action_time_emb = action_time_emb + self.observation_delay_embedding(delay)[:, None, :].to(
-                action_time_emb.dtype
-            )
+            if self.config.use_observation_delay_sincos:
+                encoder = self.observation_delay_embedding
+                delay_embedding = encoder(
+                    self._delay_position_encoding(delay, noisy_actions.shape[1]).to(
+                        next(encoder.parameters()).dtype
+                    )
+                )
+            else:
+                delay_embedding = self.observation_delay_embedding(delay)[:, None, :]
+            action_time_emb = action_time_emb + delay_embedding.to(action_time_emb.dtype)
 
-        if self.observation_delay_adarms is not None:
-            delay_condition = self.observation_delay_adarms(
-                (delay.to(dtype=action_time_emb.dtype) / max(self._delay_max, 1)).unsqueeze(-1)
-            )
-            action_time_emb = action_time_emb + delay_condition[:, None, :].to(action_time_emb.dtype)
         if tactile_condition is not None and self.tactile_adarms is not None:
             action_time_emb = action_time_emb + self.tactile_adarms(tactile_condition)[:, None, :].to(
                 action_time_emb.dtype
@@ -1468,8 +1578,22 @@ class VLAFlowMatching(nn.Module):
         # copy of A0 with the same noisy input and timestep condition, but its
         # attention row is isolated so only CA0 consumes tactile context.
         use_tactile_token = tactile_embedding is not None and self.config.use_tactile_token
+        use_delay_token = self.observation_delay_token_embedding is not None
         action_tokens = action_time_emb
         action_att_masks = self._action_att_masks(bsize, device, torch.bool)
+        if use_delay_token:
+            count = self._delay_token_count(noisy_actions.shape[1])
+            if getattr(self.config, "use_observation_delay_sincos", False):
+                encoder = self.observation_delay_token_embedding
+                delay_token = encoder(
+                    self._delay_position_encoding(delay, count).to(next(encoder.parameters()).dtype)
+                )
+            else:
+                delay_token = self.observation_delay_token_embedding(delay)[:, None, :]
+            delay_token = delay_token.to(dtype=action_time_emb.dtype)
+            embs.append(delay_token)
+            pad_masks.append(torch.ones(bsize, count, dtype=torch.bool, device=device))
+            att_masks += [1] + [0] * (count - 1)
         if use_tactile_token:
             tactile_token = tactile_embedding[:, None, :].to(dtype=action_time_emb.dtype)
             conditioned_copy = action_time_emb[:, :1]
@@ -1518,6 +1642,89 @@ class VLAFlowMatching(nn.Module):
             constant,
             chunk_times,
         )
+
+    def _noise_condition(
+        self, timestep: Tensor, action_count: int, *, tactile_token: bool = False
+    ) -> Tensor | None:
+        """Keep token-wise flow times aligned with the complete FM suffix."""
+        if not getattr(self.config, "use_noise_adarms", False):
+            return None
+
+        def encode(time: Tensor) -> Tensor:
+            encoded = create_sinusoidal_pos_embedding(
+                time,
+                self.vlm_with_expert.expert_hidden_size,
+                self.config.min_period,
+                self.config.max_period,
+                device=time.device,
+            ).to(self.time_mlp_in.weight.dtype)
+            return F.silu(self.time_mlp_out(F.silu(self.time_mlp_in(encoded))))
+
+        if timestep.ndim == 2:
+            if timestep.shape[1] < action_count:
+                raise ValueError("Token-wise timestep must cover every action token")
+            timestep = timestep[:, :action_count]
+        encoded = encode(timestep)
+        if encoded.ndim == 2:
+            encoded = encoded[:, None, :].expand(-1, action_count, -1)
+        conditions = []
+        # Dynamic condition tokens are clean. CA0 shares the exact flow time of A0.
+        static_count = self._delay_token_count(action_count) + int(tactile_token)
+        if static_count:
+            clean = encode(torch.zeros(timestep.shape[0], device=timestep.device, dtype=timestep.dtype))
+            conditions.append(clean[:, None, :].expand(-1, static_count, -1))
+        if tactile_token:
+            conditions.append(encoded[:, :1])
+        return torch.cat([*conditions, encoded], dim=1)
+
+    def _observation_delay_modulation_mask(
+        self,
+        batch_size: int,
+        device: torch.device,
+        observation_delay_chunks: Tensor | None = None,
+        observation_delay_tokens: Tensor | None = None,
+    ) -> Tensor | None:
+        """Enable Zero modulation per sample using the first action's observation age."""
+        if not getattr(self.config, "observation_delay_zero_bypass", False):
+            return None
+        return (
+            self._delay_tensor(
+                observation_delay_chunks, observation_delay_tokens, batch_size=batch_size, device=device
+            )
+            > 0
+        )
+
+    def _observation_delay_condition(
+        self,
+        batch_size: int,
+        device: torch.device,
+        observation_delay_chunks: Tensor | None = None,
+        observation_delay_tokens: Tensor | None = None,
+        *,
+        action_count: int | None = None,
+        tactile_token: bool = False,
+    ) -> Tensor | None:
+        """Encode the current delay for adaptive norms, independently of prefix KV."""
+        if self.observation_delay_adarms is None:
+            return None
+        delay = self._delay_tensor(
+            observation_delay_chunks,
+            observation_delay_tokens,
+            batch_size=batch_size,
+            device=device,
+        )
+        dtype = self.observation_delay_adarms[0].weight.dtype
+        if getattr(self.config, "use_observation_delay_sincos", False):
+            count = action_count if action_count is not None else self.config.chunk_size
+            encoded = self.observation_delay_adarms(self._delay_position_encoding(delay, count).to(dtype))
+            # Match the suffix layout: D0..D(L-1), optional T/CA0, then A0..A(L-1).
+            conditions = []
+            if self.observation_delay_token_embedding is not None:
+                conditions.append(encoded)
+            if tactile_token:
+                conditions.append(encoded[:, :1].expand(-1, 2, -1))
+            return torch.cat([*conditions, encoded], dim=1)
+        return self.observation_delay_adarms((delay.to(dtype=dtype) / max(self._delay_max, 1)).unsqueeze(-1))
 
     def forward(
         self,
@@ -1581,11 +1788,22 @@ class VLAFlowMatching(nn.Module):
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        delay_token_count = self._delay_token_count(actions.shape[1])
+        if self.observation_delay_token_embedding is not None:
+            att_2d_masks = self._apply_delay_token_mask(
+                att_2d_masks,
+                prefix_len=prefix_pad_masks.shape[1],
+                action_count=self.config.chunk_size,
+                action_start_offset=delay_token_count
+                + (2 if tactile_embedding is not None and self.config.use_tactile_token else 0),
+                delay_token_count=delay_token_count,
+            )
         if tactile_embedding is not None and self.config.use_tactile_token:
             att_2d_masks = self._apply_tactile_token_mask(
                 att_2d_masks,
                 prefix_len=prefix_pad_masks.shape[1],
                 action_count=self.config.chunk_size,
+                delay_token=delay_token_count,
             )
         attention_bias = None
         if self.training and self.config.streaming and self.config.streaming_attention_mode == "random_gate":
@@ -1605,6 +1823,9 @@ class VLAFlowMatching(nn.Module):
         if tactile_embedding is not None and self.config.use_tactile_token:
             copy_index = prefix_pad_masks.shape[1] + 1
             action0_index = prefix_pad_masks.shape[1] + 2
+            if self.observation_delay_token_embedding is not None:
+                copy_index += delay_token_count
+                action0_index += delay_token_count
             position_ids[:, action0_index] = position_ids[:, copy_index]
         (_, suffix_out), _ = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
@@ -1613,6 +1834,22 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
             attention_bias=attention_bias,
+            noise_condition=self._noise_condition(
+                model_time,
+                actions.shape[1],
+                tactile_token=tactile_embedding is not None and self.config.use_tactile_token,
+            ),
+            delay_modulation_mask=self._observation_delay_modulation_mask(
+                actions.shape[0], actions.device, observation_delay_chunks, observation_delay_tokens
+            ),
+            expert_condition=self._observation_delay_condition(
+                actions.shape[0],
+                actions.device,
+                observation_delay_chunks,
+                observation_delay_tokens,
+                action_count=actions.shape[1],
+                tactile_token=tactile_embedding is not None and self.config.use_tactile_token,
+            ),
         )
         copy_out = suffix_out[:, -(self.config.chunk_size + 1)] if tactile_embedding is not None else None
         suffix_out = suffix_out[:, -self.config.chunk_size :]
@@ -1682,20 +1919,30 @@ class VLAFlowMatching(nn.Module):
         else:
             noise = noise.to(device=device, dtype=torch.float32)
 
-        observation_delay_chunks = kwargs.get("observation_delay_chunks", prefix_cache.get("observation_delay_chunks"))
-        observation_delay_tokens = kwargs.get("observation_delay_tokens", prefix_cache.get("observation_delay_tokens"))
+        observation_delay_chunks = kwargs.get(
+            "observation_delay_chunks", prefix_cache.get("observation_delay_chunks")
+        )
+        observation_delay_tokens = kwargs.get(
+            "observation_delay_tokens", prefix_cache.get("observation_delay_tokens")
+        )
         inference_mode = kwargs.get("inference_mode", "stream")
         context_cfg_lambda = float(kwargs.get("context_cfg_lambda", 0.1))
+        tactile_cfg_lambda = float(kwargs.get("tactile_cfg_lambda", 1.5))
         if inference_mode not in (
             "diffusion",
             "stream",
             "stream-head",
             "stream-head-context-cfg",
             "stream-head-mean",
+            "stream-head-tactile",
+            "stream-head-tactile-cfg",
+            "stream-head-mean-tactile-cfg",
         ):
             raise ValueError(f"Unsupported SmolVLA streaming inference mode: {inference_mode}")
         if context_cfg_lambda < 0 or not math.isfinite(context_cfg_lambda):
             raise ValueError("context_cfg_lambda must be finite and non-negative")
+        if tactile_cfg_lambda < 0 or not math.isfinite(tactile_cfg_lambda):
+            raise ValueError("tactile_cfg_lambda must be finite and non-negative")
         if inference_mode == "stream":
             return self.stream_step_from_prefix(
                 prefix_cache,
@@ -1704,13 +1951,21 @@ class VLAFlowMatching(nn.Module):
                 observation_delay_chunks=observation_delay_chunks,
                 observation_delay_tokens=observation_delay_tokens,
             )
-        if inference_mode in ("stream-head", "stream-head-context-cfg", "stream-head-mean"):
+        if inference_mode in (
+            "stream-head",
+            "stream-head-context-cfg",
+            "stream-head-mean",
+            "stream-head-tactile",
+            "stream-head-tactile-cfg",
+            "stream-head-mean-tactile-cfg",
+        ):
             return self.stream_head_step_from_prefix(
                 prefix_cache,
                 tactile_batch=tactile_batch,
                 noise=noise,
                 inference_mode=inference_mode,
                 context_cfg_lambda=context_cfg_lambda,
+                tactile_cfg_lambda=tactile_cfg_lambda,
                 observation_delay_chunks=observation_delay_chunks,
                 observation_delay_tokens=observation_delay_tokens,
             )
@@ -1823,9 +2078,7 @@ class VLAFlowMatching(nn.Module):
             # Match Master_Research: remove the already-ready chunk before the
             # FM call, so the model always sees exactly H future tokens.
             model_actions = action_window[:, block:]
-            timestep_window = self._streaming_timestep_schedule(
-                device=device, dtype=action_window.dtype
-            )
+            timestep_window = self._streaming_timestep_schedule(device=device, dtype=action_window.dtype)
             raw_velocity = self.denoise_step(
                 prefix_pad_masks=prefix_pad_masks,
                 past_key_values=prefix_cache["past_key_values"],
@@ -1840,10 +2093,14 @@ class VLAFlowMatching(nn.Module):
             )
             # Clean the complete outgoing chunk, then transport each future
             # chunk by the timestep difference caused by the block shift.
-            outgoing = model_actions[:, :block] - timestep_window[:block][None, :, None] * raw_velocity[:, :block]
-            future = model_actions[:, block:] + (
-                timestep_window[:-block][None, :, None] - timestep_window[block:][None, :, None]
-            ) * raw_velocity[:, block:]
+            outgoing = (
+                model_actions[:, :block] - timestep_window[:block][None, :, None] * raw_velocity[:, :block]
+            )
+            future = (
+                model_actions[:, block:]
+                + (timestep_window[:-block][None, :, None] - timestep_window[block:][None, :, None])
+                * raw_velocity[:, block:]
+            )
             fresh_noise = self.sample_noise((bsize, block, self.config.action_dim), device)
             action_window = torch.cat([outgoing, future, fresh_noise], dim=1)
         self._stream_state = {
@@ -1871,6 +2128,7 @@ class VLAFlowMatching(nn.Module):
         noise: Tensor | None = None,
         inference_mode: str = "stream-head",
         context_cfg_lambda: float = 0.1,
+        tactile_cfg_lambda: float = 1.5,
         observation_delay_chunks=None,
         observation_delay_tokens=None,
     ) -> Tensor:
@@ -1882,11 +2140,32 @@ class VLAFlowMatching(nn.Module):
         saved fields move with it. When a token reaches a chunk head, its
         current field is combined with its own saved fields from the preceding
         positions in that chunk.
+
+        Tactile modes change only position zero using the current CA0 field.
+        History always stores raw A fields, before either mean or CFG guidance.
         """
-        if inference_mode not in ("stream-head", "stream-head-context-cfg", "stream-head-mean"):
+        if inference_mode not in (
+            "stream-head",
+            "stream-head-context-cfg",
+            "stream-head-mean",
+            "stream-head-tactile",
+            "stream-head-tactile-cfg",
+            "stream-head-mean-tactile-cfg",
+        ):
             raise ValueError(f"Unsupported stream-head mode: {inference_mode}")
         if context_cfg_lambda < 0 or not math.isfinite(context_cfg_lambda):
             raise ValueError("context_cfg_lambda must be finite and non-negative")
+        if tactile_cfg_lambda < 0 or not math.isfinite(tactile_cfg_lambda):
+            raise ValueError("tactile_cfg_lambda must be finite and non-negative")
+        tactile_mode = inference_mode in (
+            "stream-head-tactile",
+            "stream-head-tactile-cfg",
+            "stream-head-mean-tactile-cfg",
+        )
+        if tactile_mode and not self.config.use_tactile_token:
+            raise ValueError(f"{inference_mode} requires use_tactile_token=True")
+        if tactile_mode and tactile_batch is None:
+            raise ValueError(f"{inference_mode} requires a tactile observation")
 
         prefix_pad_masks = prefix_cache["prefix_pad_masks"]
         bsize = prefix_pad_masks.shape[0]
@@ -1928,12 +2207,13 @@ class VLAFlowMatching(nn.Module):
                 noise,
                 self.config.num_steps,
             )
-            timestep_window = self._streaming_timestep_schedule(
-                device=device, dtype=torch.float32
-            )[None, :].expand(bsize, -1).clone()
+            timestep_window = (
+                self._streaming_timestep_schedule(device=device, dtype=torch.float32)[None, :]
+                .expand(bsize, -1)
+                .clone()
+            )
             action_window = (
-                timestep_window[..., None] * noise
-                + (1.0 - timestep_window[..., None]) * clean_actions
+                timestep_window[..., None] * noise + (1.0 - timestep_window[..., None]) * clean_actions
             )
             history = torch.zeros(
                 (bsize, horizon, history_length, action_window.shape[-1]),
@@ -1978,7 +2258,7 @@ class VLAFlowMatching(nn.Module):
                 if tactile_batch is not None and self.tactile_adarms is not None
                 else None
             )
-        raw_velocity = self.denoise_step(
+        denoise_result = self.denoise_step(
             prefix_pad_masks=prefix_pad_masks,
             past_key_values=prefix_cache["past_key_values"],
             x_t=action_window,
@@ -1990,10 +2270,17 @@ class VLAFlowMatching(nn.Module):
             inference_mode="stream",
             context_cfg_lambda=context_cfg_lambda,
             apply_head_guidance=False,
+            return_tactile_copy=tactile_mode,
         )
+        if tactile_mode:
+            raw_velocity, tactile_velocity = denoise_result
+        else:
+            raw_velocity = denoise_result
+            tactile_velocity = None
 
         head_indices = torch.arange(0, horizon, block, device=device)
         current_heads = raw_velocity[:, head_indices]
+        tactile_head = tactile_velocity[:, None, :] if tactile_velocity is not None else None
         if history_length:
             # Use only fields recorded before the current position. The
             # current ``v_h(A)`` is added after guidance is computed.
@@ -2007,15 +2294,20 @@ class VLAFlowMatching(nn.Module):
                 (*current_heads.shape[:2], 1), dtype=current_heads.dtype, device=device
             )
 
-        if inference_mode == "stream-head-mean":
+        if inference_mode in ("stream-head-mean", "stream-head-mean-tactile-cfg"):
             count = history_count + 1.0
             guided_heads = (history_sum + current_heads) / count
         elif inference_mode == "stream-head-context-cfg":
-            guided_heads = current_heads + context_cfg_lambda * (
-                history_sum - history_count * current_heads
-            )
+            guided_heads = current_heads + context_cfg_lambda * (history_sum - history_count * current_heads)
         else:
-            guided_heads = current_heads
+            guided_heads = current_heads.clone()
+
+        if tactile_mode:
+            assert tactile_head is not None
+            if inference_mode == "stream-head-tactile":
+                guided_heads[:, :1] = tactile_head
+            else:
+                guided_heads[:, :1] += tactile_cfg_lambda * (tactile_head - current_heads[:, :1])
 
         num_chunks = max(1, math.ceil(horizon / block))
         head_dt = -torch.minimum(
@@ -2077,7 +2369,9 @@ class VLAFlowMatching(nn.Module):
             observation_delay_tokens=observation_delay_tokens,
             tactile_batch=tactile_batch,
         )
-        return self.sample_actions_from_prefix(prefix_cache, noise=noise, tactile_batch=tactile_batch, **kwargs)
+        return self.sample_actions_from_prefix(
+            prefix_cache, noise=noise, tactile_batch=tactile_batch, **kwargs
+        )
 
     def denoise_step(
         self,
@@ -2093,6 +2387,7 @@ class VLAFlowMatching(nn.Module):
         inference_mode="stream",
         context_cfg_lambda=0.1,
         apply_head_guidance=True,
+        return_tactile_copy: bool = False,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         if tactile_embedding is None and tactile_batch is not None:
@@ -2116,18 +2411,33 @@ class VLAFlowMatching(nn.Module):
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
 
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+        delay_token_count = self._delay_token_count(x_t.shape[1])
+        if self.observation_delay_token_embedding is not None:
+            full_att_2d_masks = self._apply_delay_token_mask(
+                full_att_2d_masks,
+                prefix_len=prefix_len,
+                action_count=x_t.shape[1],
+                action_start_offset=delay_token_count
+                + (2 if tactile_embedding is not None and self.config.use_tactile_token else 0),
+                query_offset=prefix_len,
+                delay_token_count=delay_token_count,
+            )
         if tactile_embedding is not None and self.config.use_tactile_token:
             full_att_2d_masks = self._apply_tactile_token_mask(
                 full_att_2d_masks,
                 prefix_len=prefix_len,
                 action_count=x_t.shape[1],
                 query_offset=prefix_len,
+                delay_token=delay_token_count,
             )
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
         if tactile_embedding is not None and self.config.use_tactile_token:
             copy_index = 1
             action0_index = 2
+            if self.observation_delay_token_embedding is not None:
+                copy_index += delay_token_count
+                action0_index += delay_token_count
             position_ids[:, action0_index] = position_ids[:, copy_index]
 
         outputs_embeds, _ = self.vlm_with_expert.forward(
@@ -2136,23 +2446,50 @@ class VLAFlowMatching(nn.Module):
             past_key_values=past_key_values,
             inputs_embeds=[None, suffix_embs],
             use_cache=self.config.use_cache,
+            noise_condition=self._noise_condition(
+                timestep,
+                x_t.shape[1],
+                tactile_token=tactile_embedding is not None and self.config.use_tactile_token,
+            ),
+            delay_modulation_mask=self._observation_delay_modulation_mask(
+                batch_size, x_t.device, observation_delay_chunks, observation_delay_tokens
+            ),
+            expert_condition=self._observation_delay_condition(
+                batch_size,
+                x_t.device,
+                observation_delay_chunks,
+                observation_delay_tokens,
+                action_count=x_t.shape[1],
+                tactile_token=tactile_embedding is not None and self.config.use_tactile_token,
+            ),
         )
         if past_key_values is not None:
             # Self-attention layers append suffix K/V in place; restore the prefix for the next step.
             for layer in past_key_values.layers:
                 layer.crop(prefix_len - layer.get_seq_length())
         suffix_out = outputs_embeds[1]
+        tactile_copy_out = None
+        if return_tactile_copy:
+            if tactile_embedding is None or not self.config.use_tactile_token:
+                raise ValueError("return_tactile_copy requires use_tactile_token=True and tactile input")
+            tactile_copy_out = suffix_out[:, -(x_t.shape[1] + 1)]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
+        if tactile_copy_out is not None:
+            tactile_copy_out = self.action_out_proj(tactile_copy_out.to(dtype=torch.float32))
         if not apply_head_guidance:
-            return v_t
-        return self._apply_head_guidance(
-            v_t,
-            inference_mode=inference_mode,
-            context_cfg_lambda=context_cfg_lambda,
-            chunk_size=self.config.chunk_size,
-            streaming_chunk_size=(
-                self.config.streaming_chunk_size if self.config.streaming else self.config.chunk_size
-            ),
-        )
+            guided = v_t
+        else:
+            guided = self._apply_head_guidance(
+                v_t,
+                inference_mode=inference_mode,
+                context_cfg_lambda=context_cfg_lambda,
+                chunk_size=self.config.chunk_size,
+                streaming_chunk_size=(
+                    self.config.streaming_chunk_size if self.config.streaming else self.config.chunk_size
+                ),
+            )
+        if return_tactile_copy:
+            return guided, tactile_copy_out
+        return guided

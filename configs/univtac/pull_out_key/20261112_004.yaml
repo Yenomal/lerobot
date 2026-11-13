@@ -1,0 +1,14 @@
+schema_version: 1
+extends: base.yaml
+
+exp_name: "20261112_004"
+scripts: "streaming with delay token 20 with delay token and random_gate"
+
+policy:
+  n_obs_steps: 21
+  streaming: true
+  streaming_attention_mode: random_gate
+  observation_delay_max_tokens: 20
+  use_observation_delay_token: true
+  use_observation_delay_embedding: false
+  use_observation_delay_adarms: false

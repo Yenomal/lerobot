@@ -43,13 +43,29 @@ class SmolVLAConfig(PreTrainedConfig):
     streaming_constant_weight: float = 0.2
     streaming_chunk_wise_weight: float = 0.8
 
+    # Concatenate the FM timestep encoding with action embeddings before the MLP.
+    # Disabling this removes the explicit time condition, not action noising.
+    use_noise_embedding: bool = True
+    # Pi0.5 flow-time AdaRMS: per-token scale/shift, residual gates and final norm.
+    use_noise_adarms: bool = False
+
     # Observation-delay conditioning. The values are discrete chunk/token
     # counts and are sampled by the policy during training when the dataset
     # does not provide explicit delay fields.
     observation_delay_max_chunks: int = 0
     observation_delay_max_tokens: int = 0
+    # Encode each action's age d+i with sinusoidal features followed by an MLP.
+    # False preserves the original scalar/table encoding for existing checkpoints.
+    use_observation_delay_sincos: bool = False
     use_observation_delay_embedding: bool = False
+    # Per-expert-layer scale/shift after the attention and MLP RMSNorms.
     use_observation_delay_adarms: bool = False
+    # Keep pretrained RMSNorm; add scale/shift and zero-initialized residual gates.
+    use_observation_delay_adaln_zero: bool = False
+    # At d=0, bypass Zero scale/shift and use residual gate=1 for every action.
+    observation_delay_zero_bypass: bool = False
+    # Add FM delay tokens: one shared token, or one per action with sin/cos encoding.
+    use_observation_delay_token: bool = False
 
     # Tactile conditioning. The feature names are intentionally configurable
     # because UniVTAC datasets use both dotted and flat naming conventions.
@@ -167,8 +183,7 @@ class SmolVLAConfig(PreTrainedConfig):
         allowed_attention_modes = {"bidirectional", "mask", "causal", "random_gate"}
         if self.streaming_attention_mode not in allowed_attention_modes:
             raise ValueError(
-                "SmolVLA streaming_attention_mode must be one of: "
-                "bidirectional, mask, causal, random_gate"
+                "SmolVLA streaming_attention_mode must be one of: bidirectional, mask, causal, random_gate"
             )
         if self.streaming_chunk_size <= 0:
             raise ValueError("streaming_chunk_size must be positive")
@@ -183,14 +198,28 @@ class SmolVLAConfig(PreTrainedConfig):
         if self.observation_delay_max_chunks < 0 or self.observation_delay_max_tokens < 0:
             raise ValueError("observation delay limits must be non-negative")
         if self.observation_delay_max_chunks and self.observation_delay_max_tokens:
-            raise ValueError("observation_delay_max_chunks and observation_delay_max_tokens cannot both be non-zero")
+            raise ValueError(
+                "observation_delay_max_chunks and observation_delay_max_tokens cannot both be non-zero"
+            )
         if (self.observation_delay_max_chunks or self.observation_delay_max_tokens) and not self.streaming:
             raise ValueError("observation delay requires streaming=True")
-        if self.use_observation_delay_embedding or self.use_observation_delay_adarms:
-            if self.observation_delay_max_chunks == 0 and self.observation_delay_max_tokens == 0:
-                raise ValueError(
-                    "observation delay conditioning requires a non-zero observation delay limit"
-                )
+        if (
+            (
+                self.use_observation_delay_embedding
+                or self.use_observation_delay_adarms
+                or self.use_observation_delay_adaln_zero
+                or self.use_observation_delay_token
+            )
+            and self.observation_delay_max_chunks == 0
+            and self.observation_delay_max_tokens == 0
+        ):
+            raise ValueError("observation delay conditioning requires a non-zero observation delay limit")
+        if self.use_observation_delay_adarms and self.use_observation_delay_adaln_zero:
+            raise ValueError("observation delay AdaRMS and AdaLN-Zero cannot both be enabled")
+        if self.observation_delay_zero_bypass and (
+            not self.use_observation_delay_adaln_zero or self.use_noise_adarms
+        ):
+            raise ValueError("observation_delay_zero_bypass requires delay AdaLN-Zero without noise AdaRMS")
         if self.use_tactile_adarms and not self.use_tactile:
             raise ValueError("use_tactile_adarms requires use_tactile=True")
         if self.use_tactile_token and not self.use_tactile:
@@ -201,10 +230,14 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError("tactile_token_history_length must be positive")
         if self.tactile_tcn_width <= 0:
             raise ValueError("tactile_tcn_width must be positive")
-        if not math.isfinite(self.streaming_constant_weight) or not math.isfinite(self.streaming_chunk_wise_weight):
+        if not math.isfinite(self.streaming_constant_weight) or not math.isfinite(
+            self.streaming_chunk_wise_weight
+        ):
             raise ValueError("streaming regime weights must be finite")
         if self.state_dim <= 0 or self.action_dim <= 0:
-            raise ValueError(f"SmolVLA state_dim/action_dim must be positive, got {self.state_dim}/{self.action_dim}.")
+            raise ValueError(
+                f"SmolVLA state_dim/action_dim must be positive, got {self.state_dim}/{self.action_dim}."
+            )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "

@@ -112,6 +112,21 @@ def load_runtime_runner(checkpoint: str, device: str) -> PolicyRunner:
     )
 
 
+def _validate_tactile_mode(runner: PolicyRunner, inference_mode: str) -> None:
+    if inference_mode not in (
+        "stream-head-tactile",
+        "stream-head-tactile-cfg",
+        "stream-head-mean-tactile-cfg",
+    ):
+        return
+    if not getattr(runner.policy.config, "use_tactile_token", False):
+        raise ValueError(f"{inference_mode} requires use_tactile_token=True")
+    if not getattr(runner.policy.config, "streaming", False) or not all(
+        callable(getattr(runner, method, None)) for method in ("encode_prefix", "predict_from_prefix")
+    ):
+        raise ValueError(f"{inference_mode} requires split streaming inference")
+
+
 class RuntimeSession:
     """Server-owned action queue and at-least-once action delivery."""
 
@@ -124,9 +139,11 @@ class RuntimeSession:
         streaming_watermark: int | None = None,
         inference_mode: str = "stream",
         context_cfg_lambda: float = 0.1,
+        tactile_cfg_lambda: float = 1.5,
     ) -> None:
         if queue_size <= 0:
             raise ValueError("runtime_queue_size must be positive")
+        _validate_tactile_mode(runner, inference_mode)
         self.runner = runner
         self.queue_size = queue_size
         self.actions: deque[np.ndarray] = deque()
@@ -140,15 +157,22 @@ class RuntimeSession:
             "stream-head",
             "stream-head-context-cfg",
             "stream-head-mean",
+            "stream-head-tactile",
+            "stream-head-tactile-cfg",
+            "stream-head-mean-tactile-cfg",
         ):
             raise ValueError(
                 "inference_mode must be one of: diffusion, stream, stream-head, "
-                "stream-head-context-cfg, stream-head-mean"
+                "stream-head-context-cfg, stream-head-mean, stream-head-tactile, "
+                "stream-head-tactile-cfg, stream-head-mean-tactile-cfg"
             )
         if context_cfg_lambda < 0 or not np.isfinite(context_cfg_lambda):
             raise ValueError("context_cfg_lambda must be finite and non-negative")
+        if tactile_cfg_lambda < 0 or not np.isfinite(tactile_cfg_lambda):
+            raise ValueError("tactile_cfg_lambda must be finite and non-negative")
         self.inference_mode = inference_mode
         self.context_cfg_lambda = float(context_cfg_lambda)
+        self.tactile_cfg_lambda = float(tactile_cfg_lambda)
         self.execution_id = 0
         self._prefix_bundle: tuple[dict[str, Any], Any] | None = None
         self._prefix_future = None
@@ -224,6 +248,7 @@ class RuntimeSession:
                 observation=observation,
                 inference_mode=self.inference_mode,
                 context_cfg_lambda=self.context_cfg_lambda,
+                tactile_cfg_lambda=self.tactile_cfg_lambda,
                 **self._prefix_delay_kwargs(),
             )
             actions = chunk.canonical_actions.detach().cpu().numpy().astype(np.float32, copy=True)
@@ -366,7 +391,11 @@ class RuntimeServer:
         streaming_watermark: int | None = None,
         inference_mode: str = "stream",
         context_cfg_lambda: float = 0.1,
+        tactile_cfg_lambda: float = 1.5,
     ) -> None:
+        _validate_tactile_mode(runner, inference_mode)
+        if tactile_cfg_lambda < 0 or not np.isfinite(tactile_cfg_lambda):
+            raise ValueError("tactile_cfg_lambda must be finite and non-negative")
         self.runner = runner
         self.host = host
         self.port = port
@@ -375,6 +404,7 @@ class RuntimeServer:
         self.streaming_watermark = streaming_watermark
         self.inference_mode = inference_mode
         self.context_cfg_lambda = context_cfg_lambda
+        self.tactile_cfg_lambda = tactile_cfg_lambda
         self._active = False
 
     async def serve(self) -> None:
@@ -413,6 +443,7 @@ class RuntimeServer:
             streaming_watermark=self.streaming_watermark,
             inference_mode=self.inference_mode,
             context_cfg_lambda=self.context_cfg_lambda,
+            tactile_cfg_lambda=self.tactile_cfg_lambda,
         )
         request: Envelope | None = None
         last_sequence = -1
@@ -500,7 +531,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--inference-mode",
-        choices=("diffusion", "stream", "stream-head", "stream-head-context-cfg", "stream-head-mean"),
+        choices=(
+            "diffusion",
+            "stream",
+            "stream-head",
+            "stream-head-context-cfg",
+            "stream-head-mean",
+            "stream-head-tactile",
+            "stream-head-tactile-cfg",
+            "stream-head-mean-tactile-cfg",
+        ),
         default="stream",
         help="Runtime action integration mode; diffusion forces ordinary full-chunk inference.",
     )
@@ -509,6 +549,12 @@ def main() -> None:
         type=float,
         default=0.1,
         help="Guidance strength for stream-head-context-cfg; stream-head-mean derives 1/chunk_size.",
+    )
+    parser.add_argument(
+        "--tactile-cfg-lambda",
+        type=float,
+        default=1.5,
+        help="Guidance strength for tactile stream-head modes; defaults to 1.5.",
     )
     parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     args = parser.parse_args()
@@ -534,6 +580,7 @@ def main() -> None:
             streaming_watermark=args.streaming_watermark,
             inference_mode=args.inference_mode,
             context_cfg_lambda=args.context_cfg_lambda,
+            tactile_cfg_lambda=args.tactile_cfg_lambda,
         ).serve()
     )
 

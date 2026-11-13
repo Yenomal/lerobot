@@ -11,3 +11,4 @@ policy:
   observation_delay_max_tokens: 20
   use_observation_delay_embedding: false
   use_observation_delay_adarms: true
+  use_observation_delay_sincos: true

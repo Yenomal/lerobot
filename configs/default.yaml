@@ -81,10 +81,16 @@ policy:
   streaming_attention_mode: bidirectional
   streaming_constant_weight: 0.2
   streaming_chunk_wise_weight: 0.8
+  use_noise_embedding: true
+  use_noise_adarms: false
   observation_delay_max_chunks: 0
   observation_delay_max_tokens: 0
+  use_observation_delay_sincos: false  # Per-action sin/cos(d+i) -> MLP; chunks converted to steps.
   use_observation_delay_embedding: false
-  use_observation_delay_adarms: false
+  use_observation_delay_adarms: false  # Per-layer RMSNorm scale/shift in the FM expert.
+  use_observation_delay_adaln_zero: false  # Pretrained RMSNorm scale/shift with zero residual gates.
+  observation_delay_zero_bypass: false  # Zero path: d=0 keeps original norms and residual gate=1.
+  use_observation_delay_token: false
   use_tactile: false
   use_tactile_adarms: false
   use_tactile_token: false

@@ -1,0 +1,17 @@
+schema_version: 1
+extends: base.yaml
+
+exp_name: "20261113_001"
+scripts: "streaming with delay token 20 and random_gate"
+
+policy:
+  n_obs_steps: 21
+  streaming: true
+  streaming_attention_mode: random_gate
+  observation_delay_max_tokens: 20
+  use_noise_embedding: false
+  use_noise_adarms: true
+
+steps: 30000
+log_freq: 100
+save_freq: 5000

@@ -276,6 +276,7 @@ class PolicyRunner:
         provenance: ActionProvenance | None = None,
         inference_mode: str = "stream",
         context_cfg_lambda: float = 0.1,
+        tactile_cfg_lambda: float = 1.5,
         observation_delay_tokens: int | None = None,
         observation_delay_chunks: int | None = None,
     ) -> ActionChunk:
@@ -305,6 +306,7 @@ class PolicyRunner:
                 prefix_cache,
                 inference_mode=inference_mode,
                 context_cfg_lambda=context_cfg_lambda,
+                tactile_cfg_lambda=tactile_cfg_lambda,
             ),
         )
 
