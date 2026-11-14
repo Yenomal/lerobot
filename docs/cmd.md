@@ -111,6 +111,58 @@ server: ACK(op="reset")
 
 ## 训练
 
+### EMA 权重平均（YAML 配置）
+
+`ema` 是训练配置的顶层字段，与 `policy`、`optimizer` 同级，不要放在 `policy` 下面。
+[`configs/default.yaml`](../configs/default.yaml) 默认是 `ema: null`（关闭）；在实验 YAML
+中添加下面任意一种配置即可覆盖默认值。以下数值均为对应类型的代码默认值。
+
+渐进增大衰减系数（`warmup`）：
+
+```yaml
+ema:
+  type: warmup
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_decay: 0.0
+  max_decay: 0.9999
+```
+
+使用默认参数时，只写 `ema: {type: warmup}` 即可。`warmup` 的衰减系数随平均更新次数增大，
+并限制在 `min_decay` 和 `max_decay` 之间。
+
+固定衰减系数（`constant`）：
+
+```yaml
+ema:
+  type: constant
+  update_after_step: 0
+  decay: 0.999
+```
+
+幂函数衰减（`power`，EDM2 风格）：
+
+```yaml
+ema:
+  type: power
+  update_after_step: 0
+  sigma_rel: 0.1
+```
+
+`sigma_rel` 控制平均窗口相对训练长度的宽度，取值范围为 `(0, 1/sqrt(12)]`。
+切换类型时，使用对应的参数，例如 `decay` 只用于 `constant`，`sigma_rel` 只用于 `power`。
+
+三种类型都支持 `update_after_step`：按实际执行的 optimizer 更新次数计数，前 N 次更新仅复制
+当前权重，第 N+1 次仍复制用于初始化，之后开始加权平均。设置梯度累积时，不按 micro-batch 计数。
+EMA 只平均可训练参数，使用 float32 保存平均值；训练过程中的环境评估使用 EMA 权重。
+
+要在某个实验中关闭继承来的 EMA，显式写：
+
+```yaml
+ema: null
+```
+
 ### SmolVLA streaming、observation delay 和 tactile 实验
 
 SmolVLA 的 policy 配置现在包含与 Pi05 实验对应的研究参数：

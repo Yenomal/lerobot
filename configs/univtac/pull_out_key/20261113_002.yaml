@@ -9,5 +9,10 @@ policy:
   streaming: true
   streaming_attention_mode: random_gate
   observation_delay_max_tokens: 20
-  use_noise_embedding: false
-  use_noise_adarms: true
+  use_observation_delay_embedding: false
+  use_observation_delay_adaln_zero: true
+
+ema:
+  type: constant
+  update_after_step: 0
+  decay: 0.99
