@@ -26,7 +26,10 @@ def test_dynamic_cache_codec_round_trips_cpu_tensor_layers():
 
 @pytest.mark.parametrize("unit", ["tokens", "chunks"])
 @pytest.mark.parametrize("mode", ["stream-head", "stream-head-mean-tactile-cfg"])
-def test_process_proxy_and_fm_worker_forward_tactile_guidance_and_delay(monkeypatch, unit, mode):
+@pytest.mark.parametrize("random_tactile", [False, True])
+def test_process_proxy_and_fm_worker_forward_tactile_guidance_and_delay(
+    monkeypatch, unit, mode, random_tactile
+):
     sent = []
     actions = np.zeros((2, 3), dtype=np.float32)
     proxy = ProcessStreamingRunner.__new__(ProcessStreamingRunner)
@@ -50,11 +53,18 @@ def test_process_proxy_and_fm_worker_forward_tactile_guidance_and_delay(monkeypa
         return SimpleNamespace(canonical_actions=torch.from_numpy(actions))
 
     runner = SimpleNamespace(predict_from_prefix=predict_from_prefix)
-    monkeypatch.setattr("lerobot.runtime_workers.load_runtime_runner", lambda *args: runner)
+    load_options = {}
+
+    def load_runner(*args, **kwargs):
+        load_options.update(kwargs)
+        return runner
+
+    monkeypatch.setattr("lerobot.runtime_workers.load_runtime_runner", load_runner)
     requests = iter([sent[0], {"op": "close"}])
     replies = []
     connection = SimpleNamespace(send=replies.append, recv=lambda: next(requests), close=lambda: None)
-    _worker_main("fm", "checkpoint", "cpu", connection)
+    _worker_main("fm", "checkpoint", "cpu", connection, random_tactile)
+    assert load_options.get("exp_random_tactile", False) == random_tactile
     assert seen["inference_mode"] == mode
     assert seen["tactile_cfg_lambda"] == 2.25
     assert seen[f"observation_delay_{unit}"] == 3

@@ -1,0 +1,13 @@
+schema_version: 1
+extends: 20261117_003.yaml
+
+exp_name: "20261117_005"
+scripts: "exp: reconstruction tactile"
+
+policy:
+  # Keep this backbone fixed during gate training and deployment.
+  path: /root/workspace/lerobot/outputs/train/univtac/insert_hole/20261117_003/checkpoints/008000/pretrained_model_ema
+  use_tactile_reconstruction: true
+
+steps: 8000
+save_freq: 8000

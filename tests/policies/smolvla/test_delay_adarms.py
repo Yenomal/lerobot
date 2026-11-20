@@ -71,6 +71,11 @@ def make_model(monkeypatch):
         tactile=False,
         use_noise_adarms=False,
         zero_bypass=False,
+        tactile_adarms=False,
+        tactile_cross_attention=False,
+        modality_count_bias=False,
+        expert_width_multiplier=1.0,
+        self_attn_every_n_layers=2,
     ):
         return VLAFlowMatching(
             SmolVLAConfig(
@@ -87,16 +92,19 @@ def make_model(monkeypatch):
                 use_observation_delay_sincos=sincos,
                 use_observation_delay_embedding=embedding,
                 use_observation_delay_token=delay_token,
-                use_tactile=tactile,
+                use_tactile=tactile or tactile_adarms,
+                use_tactile_adarms=tactile_adarms,
                 use_tactile_token=tactile,
+                use_tactile_cross_attention=tactile_cross_attention,
+                use_modality_count_bias=modality_count_bias,
                 use_noise_embedding=use_noise_embedding,
                 use_noise_adarms=use_noise_adarms,
                 freeze_vision_encoder=False,
-                expert_width_multiplier=1.0,
+                expert_width_multiplier=expert_width_multiplier,
                 attention_mode=attention_mode,
                 num_vlm_layers=2,
                 num_expert_layers=2,
-                self_attn_every_n_layers=2,
+                self_attn_every_n_layers=self_attn_every_n_layers,
             )
         )
 

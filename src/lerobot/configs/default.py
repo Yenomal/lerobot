@@ -44,6 +44,9 @@ class DatasetConfig:
     episodes: list[int] | None = None
     # Episode indices to drop (e.g. corrupt or heterogeneous ones). Applied on top of `episodes`.
     exclude_episodes: list[int] | None = None
+    # Actual channel semantics of decoded dataset images, before augmentation.
+    # Use bgr only for data whose red/blue channels remain swapped after decoding.
+    image_color_order: str = "rgb"
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
     revision: str | None = None
     use_imagenet_stats: bool = True
@@ -80,6 +83,8 @@ class DatasetConfig:
     eval_split: float = 0.0
 
     def __post_init__(self) -> None:
+        if self.image_color_order not in ("rgb", "bgr"):
+            raise ValueError(f"image_color_order must be 'rgb' or 'bgr', got {self.image_color_order!r}")
         if self.repo_type not in ("dataset", "bucket"):
             raise ValueError(f"repo_type must be 'dataset' or 'bucket', got {self.repo_type!r}")
         if self.eval_split != 0.0 and self.streaming:

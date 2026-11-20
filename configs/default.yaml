@@ -11,6 +11,9 @@ dataset:
   root: null
   episodes: null
   exclude_episodes: null
+  # Channel semantics AFTER decoding, not the camera format before video encoding.
+  # bgr swaps red/blue before augmentation; correctly encoded videos normally use rgb.
+  image_color_order: rgb
   image_transforms:
     enable: false
     backend: dataloader
@@ -83,6 +86,7 @@ policy:
   streaming_chunk_wise_weight: 0.8
   use_noise_embedding: true
   use_noise_adarms: false
+  use_modality_count_bias: false  # FM logits subtract log(visible keys per modality).
   observation_delay_max_chunks: 0
   observation_delay_max_tokens: 0
   use_observation_delay_sincos: false  # Per-action sin/cos(d+i) -> MLP; chunks converted to steps.
@@ -92,10 +96,22 @@ policy:
   observation_delay_zero_bypass: false  # Zero path: d=0 keeps original norms and residual gate=1.
   use_observation_delay_token: false
   use_tactile: false
-  use_tactile_adarms: false
+  use_tactile_adarms: false  # AdaLN-Zero: per-layer RMSNorm scale/shift + zero residual gates.
   use_tactile_token: false
-  use_tactile_token_history: false
-  tactile_token_history_length: 1
+  use_vlm_tactile_token: false  # Independent 720-wide tactile MLP/TCN + projector in VLM prefix.
+  use_tactile_cross_attention: false  # CA0 and the tactile block read live FM tactile K/V.
+  use_tactile_cfg_gate: false
+  use_tactile_reconstruction: false  # Frozen encoder/TCN output -> MLP -> current normalized tactile markers.
+  tactile_reconstruction_hidden_dim: 256
+  tactile_cfg_gate_hidden_dim: 256
+  tactile_cfg_lambda_init: 0.5
+  tactile_cfg_lambda_max: 2.0
+  use_tactile_token_history: false  # True: TCN-fused token. False: direct history block.
+  use_tactile_causal_attention: false  # Direct history block only: causal instead of bidirectional.
+  tactile_no_vlm_attention: false  # Tactile queries read only the tactile block, without VLM prefix K/V.
+  tactile_token_history_length: 1  # Legacy fallback when a branch length is null.
+  fm_tactile_token_history_length: null  # FM history frames, including the current frame.
+  vlm_tactile_token_history_length: null  # VLM history frames at prefix refreshes.
   tactile_tcn_width: 256
   tactile_feature_names:
     - observation.tactile.left_marker

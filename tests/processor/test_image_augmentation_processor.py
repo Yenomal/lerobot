@@ -150,11 +150,14 @@ def _dataset(image_transforms=None):
 
 
 @pytest.mark.dataset
-def test_trainer_builds_the_step_for_the_gpu_backend(cpu_generator):
+@pytest.mark.parametrize("bgr", [False, True])
+def test_trainer_builds_the_step_for_the_gpu_backend(cpu_generator, bgr):
     pytest.importorskip("datasets")  # the trainer and the dataset factory need the [dataset] extra
+    from lerobot.datasets.image_color import BGRToRGB
     from lerobot.scripts.lerobot_train import _make_image_augmentation
 
-    step = _make_image_augmentation(_train_cfg(), _dataset(), torch.device("cuda"), process_index=2)
+    dataset = _dataset(image_transforms=BGRToRGB() if bgr else None)
+    step = _make_image_augmentation(_train_cfg(), dataset, torch.device("cuda"), process_index=2)
     assert isinstance(step, ImageAugmentationProcessorStep)
     assert step.image_keys == [CAM_A, CAM_B]  # camera keys, depth left out, no rename applied
     assert step.device == "cuda" and step.chunk_size == 8 and step.compile_model is False
@@ -306,7 +309,7 @@ def test_every_worker_transform_site_honours_the_backend():
                     function = scope.name
                     break
             sites[function] = guard is not None and "backend" in ast.dump(guard)
-    assert sites == {"make_dataset": True, "make_train_eval_datasets": True}, (
+    assert sites == {"_make_training_image_transforms": True}, (
         f"ImageTransforms construction sites and whether each checks image_transforms.backend: {sites}"
     )
 

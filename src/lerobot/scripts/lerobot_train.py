@@ -69,6 +69,7 @@ from lerobot.datasets import (
     compute_sampler_state,
 )
 from lerobot.datasets.factory import make_train_eval_datasets
+from lerobot.datasets.image_color import BGRToRGB
 from lerobot.datasets.multi_dataset import MultiLeRobotDataset
 from lerobot.distributed import (
     ParallelDims,
@@ -98,8 +99,8 @@ from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.sample_weighting import SampleWeighter
 from lerobot.utils.utils import (
-    cycle,
     count_parameters,
+    cycle,
     format_big_number,
     has_method,
     init_logging,
@@ -149,7 +150,10 @@ def _make_image_augmentation(
     image_transforms = cfg.dataset.image_transforms
     if not (image_transforms.enable and image_transforms.backend == "gpu"):
         return None
-    if dataset.image_transforms is not None:
+    dataset_transforms = dataset.image_transforms
+    if isinstance(dataset_transforms, BGRToRGB):
+        dataset_transforms = dataset_transforms.transforms
+    if dataset_transforms is not None:
         raise ValueError(
             "image_transforms.backend='gpu' augments on the device, but the dataset already carries "
             "image_transforms that run in the DataLoader workers. Use one or the other."

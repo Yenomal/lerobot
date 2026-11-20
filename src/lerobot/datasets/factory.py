@@ -15,6 +15,7 @@
 # limitations under the License.
 import logging
 import math
+from collections.abc import Callable
 from pprint import pformat
 from typing import Literal, cast
 
@@ -27,6 +28,7 @@ from lerobot.transforms import ImageTransforms
 from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_IMAGE, OBS_PREFIX, OBS_STATE, REWARD
 
 from .dataset_metadata import LeRobotDatasetMetadata
+from .image_color import BGRToRGB
 from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
 from .storage import DEFAULT_STORAGE_FORMAT, is_bucket_root, load_dataset_metadata
@@ -34,6 +36,37 @@ from .streaming_dataset import DEFAULT_STREAMING_SEED, StreamingLeRobotDataset
 from .utils import resolve_episode_indices
 
 logger = logging.getLogger(__name__)
+
+
+def _make_training_image_transforms(
+    cfg: TrainPipelineConfig, *, augment: bool = True
+) -> Callable[[torch.Tensor], torch.Tensor] | None:
+    """Correct declared BGR data before either DataLoader or device augmentation."""
+    image_cfg = cfg.dataset.image_transforms
+    transforms = (
+        ImageTransforms(image_cfg)
+        if augment and image_cfg.enable and image_cfg.backend == "dataloader"
+        else None
+    )
+    return BGRToRGB(transforms) if cfg.dataset.image_color_order == "bgr" else transforms
+
+
+def _set_training_image_stats(
+    cfg: TrainPipelineConfig, dataset: LeRobotDataset | StreamingLeRobotDataset
+) -> None:
+    """Align color statistics with corrected pixels, preserving depth statistics."""
+    for key in dataset.meta.camera_keys:
+        if key in dataset.meta.depth_keys:
+            continue
+        if cfg.dataset.use_imagenet_stats:
+            dataset.meta.stats.setdefault(key, {})
+            for stats_type, stats in IMAGENET_STATS.items():
+                dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+        elif cfg.dataset.image_color_order == "bgr":
+            for stats_type, stats in dataset.meta.stats.get(key, {}).items():
+                values = torch.as_tensor(stats)
+                if values.ndim > 0 and values.shape[0] == 3:
+                    dataset.meta.stats[key][stats_type] = values.flip(0)
 
 
 def resolve_delta_timestamps(
@@ -85,6 +118,8 @@ def resolve_delta_timestamps(
             matched_image_keys.append(key)
         elif policy_key == OBS_STATE:
             indices = state_indices
+        elif policy_key.startswith(OBS_PREFIX) and "tactile" in policy_key:
+            indices = getattr(cfg, "tactile_observation_delta_indices", cfg.observation_delta_indices)
         else:
             indices = cfg.observation_delta_indices if policy_key.startswith(OBS_PREFIX) else None
         if indices is not None:
@@ -118,12 +153,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | StreamingLeRobotD
         LeRobotDataset | StreamingLeRobotDataset: a StreamingLeRobotDataset when `cfg.dataset.streaming` is set.
     """
     # On the "gpu" backend the workers only decode; lerobot-train augments each batch on the policy device.
-    image_transforms_cfg = cfg.dataset.image_transforms
-    image_transforms = (
-        ImageTransforms(image_transforms_cfg)
-        if image_transforms_cfg.enable and image_transforms_cfg.backend == "dataloader"
-        else None
-    )
+    image_transforms = _make_training_image_transforms(cfg)
 
     if isinstance(cfg.dataset.repo_id, str):
         root, repo_type_name = cfg.dataset.root, cfg.dataset.repo_type
@@ -212,13 +242,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | StreamingLeRobotD
             f"{pformat(dataset.repo_id_to_index, indent=2)}"
         )
 
-    if cfg.dataset.use_imagenet_stats:
-        for key in dataset.meta.camera_keys:
-            if key in dataset.meta.depth_keys:
-                continue  # Exclude depth keys from ImageNet stats
-            dataset.meta.stats.setdefault(key, {})
-            for stats_type, stats in IMAGENET_STATS.items():
-                dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+    _set_training_image_stats(cfg, dataset)
 
     return dataset
 
@@ -265,12 +289,7 @@ def make_train_eval_datasets(
     delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, full_dataset.meta, cfg.rename_map)
 
     # On the "gpu" backend the workers only decode; lerobot-train augments each batch on the policy device.
-    image_transforms_cfg = cfg.dataset.image_transforms
-    train_image_transforms = (
-        ImageTransforms(image_transforms_cfg)
-        if image_transforms_cfg.enable and image_transforms_cfg.backend == "dataloader"
-        else None
-    )
+    train_image_transforms = _make_training_image_transforms(cfg)
 
     train_dataset = LeRobotDataset(
         cfg.dataset.repo_id,
@@ -292,7 +311,7 @@ def make_train_eval_datasets(
         root=cfg.dataset.root,
         episodes=eval_episodes,
         delta_timestamps=delta_timestamps,
-        image_transforms=None,
+        image_transforms=_make_training_image_transforms(cfg, augment=False),
         depth_output_unit=cfg.dataset.depth_output_unit,
         revision=cfg.dataset.revision,
         video_backend=cfg.dataset.video_backend,
@@ -302,13 +321,7 @@ def make_train_eval_datasets(
         video_decoder_cache_size=cfg.dataset.video_decoder_cache_size,
     )
 
-    if cfg.dataset.use_imagenet_stats:
-        for ds in (train_dataset, eval_dataset):
-            for key in ds.meta.camera_keys:
-                if key in ds.meta.depth_keys:
-                    continue
-                ds.meta.stats.setdefault(key, {})
-                for stats_type, stats in IMAGENET_STATS.items():
-                    ds.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+    for ds in (train_dataset, eval_dataset):
+        _set_training_image_stats(cfg, ds)
 
     return train_dataset, eval_dataset

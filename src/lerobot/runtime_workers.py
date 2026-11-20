@@ -78,8 +78,12 @@ def _decode_cache(value: Any, device: str) -> Any:
     return value
 
 
-def _worker_main(role: str, checkpoint: str, device: str, connection: Connection) -> None:
-    runner = load_runtime_runner(checkpoint, device)
+def _worker_main(
+    role: str, checkpoint: str, device: str, connection: Connection, exp_random_tactile: bool = False
+) -> None:
+    runner = load_runtime_runner(
+        checkpoint, device, **({"exp_random_tactile": True} if exp_random_tactile else {})
+    )
     fm_cache_id: str | None = None
     fm_cache: Any = None
     try:
@@ -145,7 +149,7 @@ def _worker_main(role: str, checkpoint: str, device: str, connection: Connection
 class ProcessStreamingRunner:
     """PolicyRunner-compatible parent proxy for split VLM/FM workers."""
 
-    def __init__(self, checkpoint: str, vlm_device: str, fm_device: str):
+    def __init__(self, checkpoint: str, vlm_device: str, fm_device: str, *, exp_random_tactile: bool = False):
         import multiprocessing as mp
 
         self.checkpoint = checkpoint
@@ -167,7 +171,7 @@ class ProcessStreamingRunner:
         )
         self._fm_process = context.Process(
             target=_worker_main,
-            args=("fm", checkpoint, fm_device, fm_child),
+            args=("fm", checkpoint, fm_device, fm_child, exp_random_tactile),
             daemon=True,
         )
         self._vlm_process.start()

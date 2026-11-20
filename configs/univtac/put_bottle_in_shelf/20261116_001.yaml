@@ -1,0 +1,5 @@
+schema_version: 1
+extends: base.yaml
+
+exp_name: "20261116_001"
+scripts: "SmolVLA fine-tune on UniVTAC/put_bottle_in_shelf; same settings as pull_out_key/base.yaml."

@@ -80,6 +80,7 @@ coverage.xml
 
 ### Logs & Temporary Files ###
 logs/
+/log/tactile-cfg-lambda/
 tmp/
 *.log
 pip-log.txt

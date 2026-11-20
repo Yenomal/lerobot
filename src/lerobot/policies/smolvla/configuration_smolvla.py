@@ -48,6 +48,8 @@ class SmolVLAConfig(PreTrainedConfig):
     use_noise_embedding: bool = True
     # Pi0.5 flow-time AdaRMS: per-token scale/shift, residual gates and final norm.
     use_noise_adarms: bool = False
+    # FM logits subtract log(visible key count) for prefix/action/tactile+delay groups.
+    use_modality_count_bias: bool = False
 
     # Observation-delay conditioning. The values are discrete chunk/token
     # counts and are sampled by the policy during training when the dataset
@@ -70,10 +72,32 @@ class SmolVLAConfig(PreTrainedConfig):
     # Tactile conditioning. The feature names are intentionally configurable
     # because UniVTAC datasets use both dotted and flat naming conventions.
     use_tactile: bool = False
+    # Legacy option name: per-layer RMSNorm scale/shift and zero residual gates.
     use_tactile_adarms: bool = False
     use_tactile_token: bool = False
+    # Independent tactile encoder in the VLM prefix, appended after state.
+    use_vlm_tactile_token: bool = False
+    # CA0 reads the live FM tactile block; its history tokens also read each other.
+    use_tactile_cross_attention: bool = False
+    # Learn CFG strength from the final FM tactile hidden state. Training
+    # freezes the original policy and updates only this gate.
+    use_tactile_cfg_gate: bool = False
+    # Freeze the policy; decode current tactile markers from the encoder/TCN output.
+    use_tactile_reconstruction: bool = False
+    tactile_reconstruction_hidden_dim: int = 256
+    tactile_cfg_gate_hidden_dim: int = 256
+    tactile_cfg_lambda_init: float = 0.5
+    tactile_cfg_lambda_max: float = 2.0
+    # True: fuse history with TCN. False: keep each frame as an FM token.
     use_tactile_token_history: bool = False
+    # Direct history tokens read only themselves and older tactile frames.
+    use_tactile_causal_attention: bool = False
+    # Tactile queries attend only to tactile tokens, without reading VLM prefix K/V.
+    tactile_no_vlm_attention: bool = False
     tactile_token_history_length: int = 1
+    # Per-branch lengths; None preserves the legacy shared value above.
+    fm_tactile_token_history_length: int | None = None
+    vlm_tactile_token_history_length: int | None = None
     # Width of the causal tactile history encoder. The resulting token is
     # projected into the FM/action-expert stream and is refreshed per inference.
     tactile_tcn_width: int = 256
@@ -224,10 +248,55 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError("use_tactile_adarms requires use_tactile=True")
         if self.use_tactile_token and not self.use_tactile:
             raise ValueError("use_tactile_token requires use_tactile=True")
-        if self.use_tactile_token_history and not self.use_tactile_token:
-            raise ValueError("use_tactile_token_history requires use_tactile_token=True")
+        if self.use_vlm_tactile_token and not self.use_tactile:
+            raise ValueError("use_vlm_tactile_token requires use_tactile=True")
+        if self.use_tactile_cross_attention and (
+            not self.use_tactile_token or "cross" not in self.attention_mode
+        ):
+            raise ValueError(
+                "use_tactile_cross_attention requires use_tactile_token=True and cross attention"
+            )
+        if self.use_tactile_cfg_gate and not self.use_tactile_token:
+            raise ValueError("use_tactile_cfg_gate requires use_tactile_token=True")
+        if self.use_tactile_reconstruction:
+            if not self.use_tactile_token:
+                raise ValueError("use_tactile_reconstruction requires use_tactile_token=True")
+            if self.use_tactile_cfg_gate:
+                raise ValueError("use_tactile_reconstruction and use_tactile_cfg_gate are mutually exclusive")
+            if self.use_peft:
+                raise ValueError("use_tactile_reconstruction trains only the reconstruction MLP without PEFT")
+        if self.tactile_reconstruction_hidden_dim <= 0:
+            raise ValueError("tactile_reconstruction_hidden_dim must be positive")
+        if self.tactile_cfg_gate_hidden_dim <= 0:
+            raise ValueError("tactile_cfg_gate_hidden_dim must be positive")
+        if not (
+            math.isfinite(self.tactile_cfg_lambda_init)
+            and math.isfinite(self.tactile_cfg_lambda_max)
+            and 0 < self.tactile_cfg_lambda_init < self.tactile_cfg_lambda_max
+        ):
+            raise ValueError("tactile CFG lambda requires finite 0 < init < max")
+        if self.use_tactile_cfg_gate and self.use_peft:
+            raise ValueError("use_tactile_cfg_gate trains only the gate and does not support PEFT")
+        has_tactile_tokens = self.use_tactile_token or self.use_vlm_tactile_token
+        if self.use_tactile_token_history and not has_tactile_tokens:
+            raise ValueError(
+                "use_tactile_token_history requires use_tactile_token=True or use_vlm_tactile_token=True"
+            )
+        if self.tactile_no_vlm_attention and not has_tactile_tokens:
+            raise ValueError(
+                "tactile_no_vlm_attention requires use_tactile_token=True or use_vlm_tactile_token=True"
+            )
+        if self.use_tactile_causal_attention and (not has_tactile_tokens or self.use_tactile_token_history):
+            raise ValueError(
+                "use_tactile_causal_attention requires use_tactile_token=True or use_vlm_tactile_token=True, "
+                "and use_tactile_token_history=False"
+            )
         if self.tactile_token_history_length <= 0:
             raise ValueError("tactile_token_history_length must be positive")
+        for name in ("fm_tactile_token_history_length", "vlm_tactile_token_history_length"):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be positive")
         if self.tactile_tcn_width <= 0:
             raise ValueError("tactile_tcn_width must be positive")
         if not math.isfinite(self.streaming_constant_weight) or not math.isfinite(
@@ -325,6 +394,21 @@ class SmolVLAConfig(PreTrainedConfig):
         # accepts one current observation; delayed inference is represented by
         # the age of the cached VLM prefix.
         return list(range(-(self.n_obs_steps - 1), 1))
+
+    @property
+    def tactile_observation_delta_indices(self) -> list[int]:
+        count = self.get_tactile_history_length() if self.use_tactile_token else 1
+        if self.use_vlm_tactile_token:
+            vlm_count = self.get_tactile_history_length(vlm=True) + max(
+                self.observation_delay_max_tokens,
+                self.observation_delay_max_chunks * self.streaming_chunk_size,
+            )
+            count = max(count, vlm_count)
+        return list(range(-(count - 1), 1))
+
+    def get_tactile_history_length(self, *, vlm: bool = False) -> int:
+        value = self.vlm_tactile_token_history_length if vlm else self.fm_tactile_token_history_length
+        return self.tactile_token_history_length if value is None else value
 
     @property
     def action_delta_indices(self) -> list:

@@ -14,16 +14,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
-from types import MethodType
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
 from safetensors.torch import save_file
 
-from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy, VLAFlowMatching
-from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy, VLAFlowMatching
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
@@ -122,9 +121,7 @@ def test_streaming_attention_modes_are_supported(mode):
 
     assert boundaries.shape == (2, 10)
     assert boundaries[:, 0].all()
-    if mode in ("bidirectional", "mask"):
-        assert boundaries[:, 1:].sum() == 0
-    elif mode == "random_gate":
+    if mode in ("bidirectional", "mask") or mode == "random_gate":
         assert boundaries[:, 1:].sum() == 0
     elif mode == "causal":
         assert boundaries[:, 5].all()
@@ -264,7 +261,7 @@ def test_tactile_features_are_kept_when_enabled():
     assert "observation.tactile.right_marker" in config.input_features
 
 
-def test_tactile_history_aggregates_to_legacy_single_frame_projection_width():
+def test_tactile_history_aggregates_to_fm_width():
     config = SmolVLAConfig(
         use_tactile=True,
         use_tactile_token=True,
@@ -275,6 +272,10 @@ def test_tactile_history_aggregates_to_legacy_single_frame_projection_width():
     torch.nn.Module.__init__(model)
     model.config = config
     model.tactile_encoder = torch.nn.Sequential(torch.nn.Linear(504, 8))
+    model.tactile_token_tcn_in = torch.nn.Linear(8, 4)
+    model.tactile_token_tcn_1 = torch.nn.Linear(12, 4)
+    model.tactile_token_tcn_2 = torch.nn.Linear(12, 4)
+    model.tactile_token_out = torch.nn.Linear(4, 8)
     batch = {
         "observation.tactile.left_marker_history": torch.randn(1, 10, 2, 63, 2),
         "observation.tactile.right_marker_history": torch.randn(1, 10, 2, 63, 2),
@@ -296,12 +297,13 @@ def test_tactile_token_mask_isolates_t_ca0_and_a0():
     assert not masked[4, 5:].any()
     # CA0 reads prefix + T + itself.
     assert masked[5, :4].all() and masked[5, 4] and masked[5, 5]
-    assert not masked[5, 6:].any()
+    assert not masked[5, 6] and masked[5, 7:].all()  # Same other-action context as A0.
     # A0 reads prefix + its own key, never T or CA0.
     assert masked[6, :4].all() and masked[6, 6]
     assert not masked[6, 4] and not masked[6, 5]
     # Later actions cannot consume any special key.
-    assert not masked[7:, 4:7].any()
+    assert not masked[7:, 4:6].any()
+    assert masked[7:, 6].all()  # Ordinary actions retain access to A0.
 
 
 def test_tactile_token_history_uses_causal_tcn_on_fm_width():
@@ -315,8 +317,7 @@ def test_tactile_token_history_uses_causal_tcn_on_fm_width():
     model = object.__new__(VLAFlowMatching)
     torch.nn.Module.__init__(model)
     model.config = config
-    model.tactile_encoder = torch.nn.Sequential(torch.nn.Linear(504, 8))
-    model.tactile_token_proj = torch.nn.Linear(8, 6)
+    model.tactile_encoder = torch.nn.Sequential(torch.nn.Linear(504, 6))
     model.tactile_token_tcn_in = torch.nn.Linear(6, 4)
     model.tactile_token_tcn_1 = torch.nn.Linear(12, 4)
     model.tactile_token_tcn_2 = torch.nn.Linear(12, 4)
@@ -425,7 +426,9 @@ def test_streaming_training_time_samples_inside_chunk_intervals():
         (batch_size,), 0.5, dtype=torch.float32, device=device
     )
     sampled = model._sample_training_time(1, 8, torch.device("cpu"))
-    torch.testing.assert_close(sampled, torch.tensor([[0.125, 0.125, 0.375, 0.375, 0.625, 0.625, 0.875, 0.875]]))
+    torch.testing.assert_close(
+        sampled, torch.tensor([[0.125, 0.125, 0.375, 0.375, 0.625, 0.625, 0.875, 0.875]])
+    )
 
 
 def test_prepare_state_and_action_use_explicit_dynamic_dimensions():
@@ -474,7 +477,9 @@ def test_pretrained_dimension_adaptation_overlap_copies_projection_weights(tmp_p
 
     SmolVLAPolicy._load_as_safetensor(model, str(checkpoint_path), "cpu", False)
 
-    torch.testing.assert_close(model.model.state_proj.weight[:, :6], checkpoint["model.state_proj.weight"][:, :6])
+    torch.testing.assert_close(
+        model.model.state_proj.weight[:, :6], checkpoint["model.state_proj.weight"][:, :6]
+    )
     torch.testing.assert_close(
         model.model.action_in_proj.weight[:, :6],
         checkpoint["model.action_in_proj.weight"][:, :6],
@@ -482,7 +487,9 @@ def test_pretrained_dimension_adaptation_overlap_copies_projection_weights(tmp_p
     torch.testing.assert_close(
         model.model.action_out_proj.weight[:6, :], checkpoint["model.action_out_proj.weight"][:6, :]
     )
-    torch.testing.assert_close(model.model.action_out_proj.bias[:6], checkpoint["model.action_out_proj.bias"][:6])
+    torch.testing.assert_close(
+        model.model.action_out_proj.bias[:6], checkpoint["model.action_out_proj.bias"][:6]
+    )
     torch.testing.assert_close(model.model.state_proj.weight[:, 6:], initial_state_projection[:, 6:])
     torch.testing.assert_close(model.model.action_in_proj.weight[:, 6:], initial_action_input[:, 6:])
     torch.testing.assert_close(model.model.action_out_proj.weight[6:, :], initial_action_output[6:, :])

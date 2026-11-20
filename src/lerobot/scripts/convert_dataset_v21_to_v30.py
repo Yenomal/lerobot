@@ -155,10 +155,38 @@ def legacy_load_episodes(local_dir: Path) -> dict:
 
 def legacy_load_episodes_stats(local_dir: Path) -> dict:
     episodes_stats = load_jsonlines(local_dir / LEGACY_EPISODES_STATS_PATH)
-    return {
+    result = {
         item["episode_index"]: cast_stats_to_numpy(item["stats"])
         for item in sorted(episodes_stats, key=lambda x: x["episode_index"])
     }
+    features = load_info(local_dir).features
+    cropped_features = set()
+    for episode_index, stats in result.items():
+        for key, feature_stats in stats.items():
+            shape = tuple(features.get(key, {}).get("shape", ()))
+            if "tactile" not in key or len(shape) != 3 or (shape[0], shape[2]) != (2, 2):
+                continue
+            for stat_name, value in feature_stats.items():
+                if stat_name == "count" or value.shape == shape:
+                    continue
+                # Some v2.1 exports crop marker data but retain statistics for
+                # the sensor's full marker array. Apply the same leading-point
+                # crop before writing either episode or aggregate statistics.
+                if (
+                    value.ndim != 3
+                    or value.shape[0] != shape[0]
+                    or value.shape[2] != shape[2]
+                    or value.shape[1] < shape[1]
+                ):
+                    raise ValueError(
+                        f"Episode {episode_index}: {key}/{stat_name} has shape {value.shape}, "
+                        f"which cannot be cropped along the marker axis to {shape}."
+                    )
+                feature_stats[stat_name] = value[:, : shape[1], :].copy()
+                cropped_features.add(key)
+    for key in sorted(cropped_features):
+        logger.warning("Cropped legacy statistics for %s to feature shape %s", key, features[key]["shape"])
+    return result
 
 
 def legacy_load_tasks(local_dir: Path) -> tuple[dict[int, str], dict[str, int]]:

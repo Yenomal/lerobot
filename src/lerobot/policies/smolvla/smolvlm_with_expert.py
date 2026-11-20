@@ -162,6 +162,9 @@ class SmolVLMWithExpertModel(nn.Module):
         use_observation_delay_adarms: bool = False,
         use_observation_delay_adaln_zero: bool = False,
         use_noise_adarms: bool = False,
+        use_tactile_adarms: bool = False,
+        use_tactile_cross_attention: bool = False,
+        use_modality_count_bias: bool = False,
     ):
         super().__init__()
         require_package("transformers", extra="smolvla")
@@ -224,6 +227,15 @@ class SmolVLMWithExpertModel(nn.Module):
                     }
                 )
 
+        if use_tactile_adarms:
+            for layer in self.lm_expert.layers:
+                layer.tactile_adaln_zero = nn.ModuleDict(
+                    {
+                        branch: AdaptiveRMSNormZeroModulation(lm_expert_config.hidden_size)
+                        for branch in ("attention", "mlp")
+                    }
+                )
+
         self.num_expert_layers = len(self.lm_expert.layers)
         self.self_attn_every_n_layers = self_attn_every_n_layers
         if "cross" in attention_mode:
@@ -241,6 +253,16 @@ class SmolVLMWithExpertModel(nn.Module):
                     lm_expert_config.num_key_value_heads * lm_expert_config.head_dim,
                     bias=lm_expert_config.attention_bias,
                 )
+                if use_tactile_cross_attention:
+                    # Live tactile K/V come from the expert stream, whose width
+                    # differs from both VLM hidden states and cached VLM K/V.
+                    kv_width = lm_expert_config.num_key_value_heads * lm_expert_config.head_dim
+                    self.lm_expert.layers[layer_idx].tactile_cross_k = nn.Linear(
+                        lm_expert_config.hidden_size, kv_width, bias=lm_expert_config.attention_bias
+                    )
+                    self.lm_expert.layers[layer_idx].tactile_cross_v = nn.Linear(
+                        lm_expert_config.hidden_size, kv_width, bias=lm_expert_config.attention_bias
+                    )
         # Remove unused embed_tokens
         self.lm_expert.embed_tokens = None
 
@@ -250,6 +272,7 @@ class SmolVLMWithExpertModel(nn.Module):
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
         self.attention_mode = attention_mode
+        self.use_modality_count_bias = use_modality_count_bias
         self.expert_hidden_size = lm_expert_config.hidden_size
         self.set_requires_grad()
 
@@ -342,13 +365,15 @@ class SmolVLMWithExpertModel(nn.Module):
         branch: str,
         noise_condition: torch.Tensor | None = None,
         delay_modulation_mask: torch.Tensor | None = None,
+        tactile_condition: torch.Tensor | None = None,
     ) -> torch.Tensor:
         norm = layer.input_layernorm if branch == "attention" else layer.post_attention_layernorm
         if noise_condition is not None:
             combined = SmolVLMWithExpertModel._merge_noise_condition(noise_condition, condition)
-            return layer.noise_adarms[branch](hidden_states, combined)
-        normalized = norm(hidden_states)
-        if condition is not None:
+            normalized = layer.noise_adarms[branch](hidden_states, combined)
+        else:
+            normalized = norm(hidden_states)
+        if condition is not None and noise_condition is None:
             modulations = (
                 layer.observation_delay_adaln_zero
                 if hasattr(layer, "observation_delay_adaln_zero")
@@ -360,6 +385,8 @@ class SmolVLMWithExpertModel(nn.Module):
                 if delay_modulation_mask is not None
                 else modulated
             )
+        if tactile_condition is not None:
+            normalized = layer.tactile_adaln_zero[branch](normalized, tactile_condition)
         return normalized
 
     @staticmethod
@@ -370,18 +397,49 @@ class SmolVLMWithExpertModel(nn.Module):
         branch: str,
         noise_condition: torch.Tensor | None = None,
         delay_modulation_mask: torch.Tensor | None = None,
+        tactile_condition: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        gated = None
         if noise_condition is not None:
             combined = SmolVLMWithExpertModel._merge_noise_condition(noise_condition, condition)
-            return layer.noise_adarms[branch].gate(residual, combined)
-        if condition is not None and hasattr(layer, "observation_delay_adaln_zero"):
+            gated = layer.noise_adarms[branch].gate(residual, combined)
+        elif condition is not None and hasattr(layer, "observation_delay_adaln_zero"):
             gated = layer.observation_delay_adaln_zero[branch].gate(residual, condition)
-            return (
-                torch.where(delay_modulation_mask[:, None, None], gated, residual)
-                if delay_modulation_mask is not None
-                else gated
-            )
-        return residual
+            if delay_modulation_mask is not None:
+                gated = torch.where(delay_modulation_mask[:, None, None], gated, residual)
+        if tactile_condition is not None:
+            tactile_gated = layer.tactile_adaln_zero[branch].gate(residual, tactile_condition)
+            # Sum learned gates: multiplying zero-initialized gates would block
+            # gradients to both branches. Without another gate, tactile owns it.
+            return tactile_gated if gated is None else gated + tactile_gated
+        return residual if gated is None else gated
+
+    @staticmethod
+    def _modality_count_bias(
+        attention_mask: torch.Tensor,
+        *,
+        prefix_key_count: int,
+        auxiliary_key_count: int,
+        fm_query_start: int = 0,
+    ) -> torch.Tensor:
+        """Build -log(n_visible) per query for prefix, tactile+delay and action keys.
+
+        Groups occupy contiguous key ranges. CA0 belongs to the action group.
+        VLM query rows receive zero bias; empty groups have no visible entries.
+        """
+        fm_mask = attention_mask[:, fm_query_start:]
+        boundary = prefix_key_count + auxiliary_key_count
+        groups = (
+            fm_mask[..., :prefix_key_count],
+            fm_mask[..., prefix_key_count:boundary],
+            fm_mask[..., boundary:],
+        )
+        parts = []
+        for group in groups:
+            count = group.sum(dim=-1, keepdim=True).clamp_min(1).float()
+            parts.append(-count.log().expand_as(group))
+        bias = torch.cat(parts, dim=-1)
+        return F.pad(bias, (0, 0, fm_query_start, 0))
 
     def forward_attn_layer(
         self,
@@ -398,6 +456,8 @@ class SmolVLMWithExpertModel(nn.Module):
         expert_condition: torch.Tensor | None = None,
         noise_condition: torch.Tensor | None = None,
         delay_modulation_mask: torch.Tensor | None = None,
+        tactile_condition: torch.Tensor | None = None,
+        auxiliary_token_count: int = 0,
     ) -> "tuple[list[torch.Tensor], DynamicCache | None]":
         query_states = []
         key_states = []
@@ -413,6 +473,7 @@ class SmolVLMWithExpertModel(nn.Module):
                 "attention",
                 noise_condition if i == 1 else None,
                 delay_modulation_mask if i == 1 else None,
+                tactile_condition if i == 1 else None,
             )
 
             input_shape = hidden_states.shape[:-1]
@@ -463,6 +524,19 @@ class SmolVLMWithExpertModel(nn.Module):
             key_states = key_states.transpose(1, 2)
             value_states = value_states.transpose(1, 2)
 
+        if (
+            self.use_modality_count_bias
+            and inputs_embeds[1] is not None
+            and model_layers[1][layer_idx] is not None
+        ):
+            suffix_length = inputs_embeds[1].shape[1]
+            count_bias = self._modality_count_bias(
+                attention_mask_,
+                prefix_key_count=key_states.shape[1] - suffix_length,
+                auxiliary_key_count=auxiliary_token_count,
+                fm_query_start=query_states.shape[1] - suffix_length,
+            )
+            _attention_bias = count_bias if _attention_bias is None else _attention_bias + count_bias
         attention_interface = self.get_attention_interface()
 
         att_output = attention_interface(
@@ -485,6 +559,9 @@ class SmolVLMWithExpertModel(nn.Module):
         expert_condition: torch.Tensor | None = None,
         noise_condition: torch.Tensor | None = None,
         delay_modulation_mask: torch.Tensor | None = None,
+        tactile_condition: torch.Tensor | None = None,
+        tactile_token_index: int | None = None,
+        tactile_token_count: int = 1,
     ) -> "tuple[list[torch.Tensor], DynamicCache | None]":
         attention_interface = self.get_attention_interface()
 
@@ -549,6 +626,7 @@ class SmolVLMWithExpertModel(nn.Module):
                 "attention",
                 noise_condition,
                 delay_modulation_mask,
+                tactile_condition,
             )
 
             expert_input_shape = expert_hidden_states.shape[:-1]
@@ -584,6 +662,45 @@ class SmolVLMWithExpertModel(nn.Module):
                 else None
             )
 
+            prefix_key_count = expert_key_states.shape[1]
+            if tactile_token_index is not None and hasattr(expert_layer, "tactile_cross_k"):
+                if (
+                    tactile_token_count < 1
+                    or not 0 <= tactile_token_index < expert_hidden_states.shape[1] - tactile_token_count
+                ):
+                    raise ValueError("tactile_token_index must precede the action suffix")
+                tactile_end = tactile_token_index + tactile_token_count
+                tactile_hidden = expert_hidden_states[:, tactile_token_index:tactile_end]
+                tactile_key = expert_layer.tactile_cross_k(tactile_hidden).view(
+                    batch_size, tactile_token_count, -1, expert_layer.self_attn.head_dim
+                )
+                tactile_value = expert_layer.tactile_cross_v(tactile_hidden).view(
+                    batch_size, tactile_token_count, -1, expert_layer.self_attn.head_dim
+                )
+                tactile_key = apply_rope(tactile_key, expert_position_id[:, tactile_token_index:tactile_end])
+                expert_key_states = torch.cat([expert_key_states, tactile_key], dim=1)
+                expert_value_states = torch.cat([expert_value_states, tactile_value], dim=1)
+                # Reuse the suffix block mask, including causal T-to-T edges.
+                # CA0 reads the whole block; real actions and delay stay isolated.
+                tactile_visible = attention_mask[
+                    :,
+                    -expert_hidden_states.shape[1] :,
+                    prefix_key_count + tactile_token_index : prefix_key_count + tactile_end,
+                ]
+                expert_attention_mask = torch.cat([expert_attention_mask, tactile_visible], dim=-1)
+                if expert_attention_bias is not None:
+                    expert_attention_bias = F.pad(expert_attention_bias, (0, tactile_token_count))
+                # These K/V are transient: never append them to the VLM cache.
+
+            if self.use_modality_count_bias:
+                count_bias = self._modality_count_bias(
+                    expert_attention_mask,
+                    prefix_key_count=prefix_key_count,
+                    auxiliary_key_count=expert_key_states.shape[1] - prefix_key_count,
+                )
+                expert_attention_bias = (
+                    count_bias if expert_attention_bias is None else expert_attention_bias + count_bias
+                )
             expert_query_states = apply_rope(expert_query_state, expert_position_id)
 
             att_output = attention_interface(
@@ -627,6 +744,10 @@ class SmolVLMWithExpertModel(nn.Module):
         expert_condition: torch.Tensor | None = None,
         noise_condition: torch.Tensor | None = None,
         delay_modulation_mask: torch.Tensor | None = None,
+        tactile_condition: torch.Tensor | None = None,
+        tactile_token_index: int | None = None,
+        tactile_token_count: int = 1,
+        auxiliary_token_count: int = 0,
     ):
         if inputs_embeds is None:
             raise ValueError(
@@ -674,6 +795,8 @@ class SmolVLMWithExpertModel(nn.Module):
                     expert_condition=expert_condition,
                     noise_condition=noise_condition,
                     delay_modulation_mask=delay_modulation_mask,
+                    tactile_condition=tactile_condition,
+                    auxiliary_token_count=auxiliary_token_count,
                 )
             else:
                 att_outputs, past_key_values = self.forward_cross_attn_layer(
@@ -690,6 +813,9 @@ class SmolVLMWithExpertModel(nn.Module):
                     expert_condition=expert_condition,
                     noise_condition=noise_condition,
                     delay_modulation_mask=delay_modulation_mask,
+                    tactile_condition=tactile_condition,
+                    tactile_token_index=tactile_token_index,
+                    tactile_token_count=tactile_token_count,
                 )
             outputs_embeds = []
             start = 0
@@ -717,6 +843,7 @@ class SmolVLMWithExpertModel(nn.Module):
                         "attention",
                         time_condition,
                         delay_modulation_mask if i == 1 else None,
+                        tactile_condition if i == 1 else None,
                     )
 
                     out_emb += hidden_states
@@ -729,6 +856,7 @@ class SmolVLMWithExpertModel(nn.Module):
                         "mlp",
                         time_condition,
                         delay_modulation_mask if i == 1 else None,
+                        tactile_condition if i == 1 else None,
                     )
                     out_emb = layer.mlp(out_emb)
                     out_emb = self._conditioned_residual(
@@ -738,6 +866,7 @@ class SmolVLMWithExpertModel(nn.Module):
                         "mlp",
                         time_condition,
                         delay_modulation_mask if i == 1 else None,
+                        tactile_condition if i == 1 else None,
                     )
 
                     out_emb += after_first_residual
@@ -816,6 +945,9 @@ class SmolVLMWithExpertModel(nn.Module):
         big_neg = torch.finfo(att_weights.dtype).min  # -2.3819763e38  # See gemma/modules.py
         masked_att_weights = torch.where(attention_mask[:, None, :, :], att_weights, big_neg)
         probs = nn.functional.softmax(masked_att_weights, dim=-1)
+        # A query with no visible keys must return zero, rather than averaging
+        # every masked value. This occurs for isolated T in prefix-only cross layers.
+        probs = probs.masked_fill(~attention_mask[:, None, :, :], 0)
         probs = probs.to(dtype=value_states.dtype)
 
         att_output = torch.matmul(probs, value_states.permute(0, 2, 1, 3))

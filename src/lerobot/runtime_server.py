@@ -81,7 +81,7 @@ def _feature_specs(config: PreTrainedConfig) -> tuple[tuple[FeatureSpec, ...], F
     return tuple(features), action
 
 
-def load_runtime_runner(checkpoint: str, device: str) -> PolicyRunner:
+def load_runtime_runner(checkpoint: str, device: str, *, exp_random_tactile: bool = False) -> PolicyRunner:
     """Load a checkpoint using only its saved model and processor configuration."""
     device = _resolve_device(device)
     path = Path(checkpoint)
@@ -92,6 +92,12 @@ def load_runtime_runner(checkpoint: str, device: str) -> PolicyRunner:
     policy_class = get_policy_class(config.type)
     policy = policy_class.from_pretrained(resolved, config=config)
     policy.to(device).eval()
+    if exp_random_tactile:
+        enable_experiment = getattr(policy, "enable_random_tactile_experiment", None)
+        if not callable(enable_experiment):
+            raise ValueError("--exp-random-tactile requires a SmolVLA tactile-token policy")
+        enable_experiment()
+        logger.info("Random tactile experiment enabled: normalized N(0,1), independent RNG seed=0")
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=config,
         pretrained_path=resolved,
@@ -178,10 +184,11 @@ class RuntimeSession:
         self._prefix_future = None
         self._prefix_execution_id: int | None = None
         self._prefix_executor = None
-        self._streaming_enabled = inference_mode != "diffusion" and bool(
-            getattr(runner.policy.config, "streaming", False)
-        ) and callable(getattr(runner, "encode_prefix", None)) and callable(
-            getattr(runner, "predict_from_prefix", None)
+        self._streaming_enabled = (
+            inference_mode != "diffusion"
+            and bool(getattr(runner.policy.config, "streaming", False))
+            and callable(getattr(runner, "encode_prefix", None))
+            and callable(getattr(runner, "predict_from_prefix", None))
         )
         if self._streaming_enabled:
             horizon = int(streaming_horizon or getattr(runner.policy.config, "chunk_size", queue_size))
@@ -557,8 +564,15 @@ def main() -> None:
         help="Guidance strength for tactile stream-head modes; defaults to 1.5.",
     )
     parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
+    parser.add_argument(
+        "--exp-random-tactile",
+        action="store_true",
+        help="Experiment: replace normalized tactile inputs with N(0,1) samples before FM encoding.",
+    )
     args = parser.parse_args()
-    logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(message)s"
+    )
     device = _resolve_device(args.device)
     if args.mode == "process":
         from lerobot.runtime_workers import ProcessStreamingRunner
@@ -567,9 +581,10 @@ def main() -> None:
             args.checkpoint,
             args.vlm_device or device,
             args.fm_device or device,
+            exp_random_tactile=args.exp_random_tactile,
         )
     else:
-        runner = load_runtime_runner(args.checkpoint, device)
+        runner = load_runtime_runner(args.checkpoint, device, exp_random_tactile=args.exp_random_tactile)
     asyncio.run(
         RuntimeServer(
             runner,

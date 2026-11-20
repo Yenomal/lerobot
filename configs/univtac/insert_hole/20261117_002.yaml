@@ -1,0 +1,17 @@
+schema_version: 1
+extends: base.yaml
+
+exp_name: "20261117_002"
+scripts: "tactile adaln use the embedding noise tactile will work as prefix"
+
+policy:
+  streaming: true
+  streaming_attention_mode: random_gate
+  n_obs_steps: 21
+  observation_delay_max_tokens: 20
+  use_observation_delay_adaln_zero: true
+  use_tactile: true
+  use_tactile_token: true
+  use_tactile_cross_attention: true
+  use_tactile_token_history: true
+  tactile_token_history_length: 10
