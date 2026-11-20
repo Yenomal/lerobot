@@ -536,6 +536,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 value = batch[current_key]
                 if not torch.is_tensor(value):
                     value = torch.as_tensor(value)
+                if batch.get("_runtime_tactile_history", False):
+                    # Runtime-owned history is already sampled before dispatch.
+                    # Keep it intact for independent VLM/FM window selection.
+                    continue
                 stores = []
                 if tactile_history_store is not None:
                     stores.append(

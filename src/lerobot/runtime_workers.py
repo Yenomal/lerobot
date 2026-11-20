@@ -17,6 +17,16 @@ from lerobot.inference import ActionChunk, ActionProvenance, ObservationSnapshot
 from lerobot.runtime_server import load_runtime_runner
 
 
+def _observation_metadata(observation: ObservationSnapshot) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"capture_time": observation.capture_time}
+    if observation.tactile_history is not None:
+        metadata.update(
+            tactile_history=dict(observation.tactile_history),
+            tactile_history_times=observation.tactile_history_times,
+        )
+    return metadata
+
+
 def _cpu_tree(value: Any) -> Any:
     if torch.is_tensor(value):
         return value.detach().to(device="cpu").contiguous()
@@ -103,9 +113,11 @@ def _worker_main(
             if role == "vlm" and op == "encode_prefix":
                 observation = ObservationSnapshot(
                     request["features"],
-                    0.0,
+                    request.get("capture_time", 0.0),
                     request["task"],
                     observation_id=str(request["sequence"]),
+                    tactile_history=request.get("tactile_history"),
+                    tactile_history_times=tuple(request.get("tactile_history_times", ())),
                 )
                 prepared, cache = runner.encode_prefix(observation)
                 connection.send({"prepared": _cpu_tree(prepared), "cache": _encode_cache(cache)})
@@ -119,9 +131,11 @@ def _worker_main(
                     raise ValueError("FM prefix cache is not loaded; submit the cache before reusing its ID")
                 observation = ObservationSnapshot(
                     request["features"],
-                    0.0,
+                    request.get("capture_time", 0.0),
                     request["task"],
                     observation_id=str(request["sequence"]),
+                    tactile_history=request.get("tactile_history"),
+                    tactile_history_times=tuple(request.get("tactile_history_times", ())),
                 )
                 result = runner.predict_from_prefix(
                     {},
@@ -194,6 +208,7 @@ class ProcessStreamingRunner:
                     "features": dict(observation.features),
                     "task": observation.task,
                     "sequence": observation.observation_id,
+                    **_observation_metadata(observation),
                 }
             )
             result = self._vlm_parent.recv()
@@ -237,6 +252,7 @@ class ProcessStreamingRunner:
             "features": dict(observation.features),
             "task": observation.task,
             "sequence": observation.observation_id,
+            **_observation_metadata(observation),
             "inference_mode": inference_mode,
             "context_cfg_lambda": context_cfg_lambda,
             "tactile_cfg_lambda": tactile_cfg_lambda,

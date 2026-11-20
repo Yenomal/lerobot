@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections import deque
 import concurrent.futures
 import logging
+import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -180,6 +181,18 @@ class RuntimeSession:
         self.context_cfg_lambda = float(context_cfg_lambda)
         self.tactile_cfg_lambda = float(tactile_cfg_lambda)
         self.execution_id = 0
+        config = runner.policy.config
+        lengths = [1]
+        for branch, enabled in (("fm", "use_tactile_token"), ("vlm", "use_vlm_tactile_token")):
+            if getattr(config, enabled, False):
+                value = getattr(config, f"{branch}_tactile_token_history_length", None)
+                lengths.append(
+                    int(getattr(config, "tactile_token_history_length", 1) if value is None else value)
+                )
+        self._tactile_history_length = max(lengths)
+        self._tactile_history: deque[tuple[float, dict[str, np.ndarray]]] = deque(
+            maxlen=self._tactile_history_length
+        )
         self._prefix_bundle: tuple[dict[str, Any], Any] | None = None
         self._prefix_future = None
         self._prefix_execution_id: int | None = None
@@ -227,13 +240,7 @@ class RuntimeSession:
         self._prefix_future_execution_id = execution_id
         self._prefix_future = self._prefix_executor.submit(self.runner.encode_prefix, observation)
 
-    def _infer_streaming(
-        self,
-        features: dict[str, np.ndarray],
-        task: str,
-        sequence: int,
-    ) -> dict[str, Any]:
-        observation = ObservationSnapshot(features, 0.0, task, observation_id=str(sequence))
+    def _infer_streaming(self, observation: ObservationSnapshot, sequence: int) -> dict[str, Any]:
         self._collect_prefix()
         if self._prefix_bundle is None:
             self._schedule_prefix(observation, self.execution_id)
@@ -313,6 +320,7 @@ class RuntimeSession:
         self.last_acknowledged_id = None
         self.task = None
         self.execution_id = 0
+        self._tactile_history.clear()
         if self._prefix_future is not None:
             self._prefix_future.cancel()
         self._prefix_future = None
@@ -342,16 +350,17 @@ class RuntimeSession:
             self.actions.clear()
             self.runner.reset(full=True)
             self.execution_id = 0
+            self._tactile_history.clear()
             if self._prefix_future is not None:
                 self._prefix_future.cancel()
             self._prefix_future = None
             self._prefix_bundle = None
             self._prefix_execution_id = None
         self.task = task
+        observation = self._observation(features, task, sequence)
         if self._streaming_enabled:
-            return self._infer_streaming(features, task, sequence)
+            return self._infer_streaming(observation, sequence)
         if not self.actions:
-            observation = ObservationSnapshot(features, 0.0, task, observation_id=str(sequence))
             # SmolVLA's direct chunk API defaults to its stateful streaming
             # window. Explicitly select full-chunk diffusion here; the split
             # streaming path above already passes its own mode explicitly.
@@ -384,6 +393,39 @@ class RuntimeSession:
         self.next_action_id += 1
         self.pending = response
         return response
+
+    def _observation(self, features: dict[str, np.ndarray], task: str, sequence: int) -> ObservationSnapshot:
+        """Append each accepted control observation, even while actions play back.
+
+        Every submitted prefix/FM snapshot owns its history; background VLM
+        work cannot observe later appends or a reset of the session's pool.
+        """
+        now = time.monotonic()
+        config = self.runner.policy.config
+        enabled = getattr(config, "use_tactile_token", False) or getattr(
+            config, "use_vlm_tactile_token", False
+        )
+        tactile = {
+            name: np.array(value, copy=True)
+            for name, value in features.items()
+            if enabled and "tactile" in name.lower()
+        }
+        history = None
+        times = ()
+        if tactile:
+            self._tactile_history.append((now, tactile))
+            frames = list(self._tactile_history)
+            frames = [frames[0]] * (self._tactile_history_length - len(frames)) + frames
+            history = {name: np.stack([values[name] for _, values in frames]) for name in tactile}
+            times = tuple(timestamp for timestamp, _ in frames)
+        return ObservationSnapshot(
+            features,
+            now,
+            task,
+            observation_id=str(sequence),
+            tactile_history=history,
+            tactile_history_times=times,
+        )
 
 
 class RuntimeServer:

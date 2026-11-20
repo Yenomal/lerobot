@@ -228,9 +228,32 @@ class PolicyRunner:
             if feature.kind == "rgb":
                 tensor = tensor.permute(2, 0, 1).contiguous().to(torch.float32).div_(255)
             batch[feature.name] = tensor.unsqueeze(0)
+        if observation.tactile_history is not None:
+            specifications = {feature.name: feature for feature in self.capabilities.features}
+            for name, history in observation.tactile_history.items():
+                feature = specifications.get(name)
+                if feature is None or "tactile" not in name.lower() or feature.kind != "tensor":
+                    raise ValueError(f"Unknown tactile history feature {name!r}")
+                if (
+                    history.shape[1:] != feature.shape
+                    or history.dtype != np.dtype(feature.dtype)
+                    or not np.isfinite(history).all()
+                ):
+                    raise ValueError(
+                        f"Tactile history shape/dtype/value differs from the serving contract: {name}"
+                    )
+                # Use the original feature key so saved normalization applies to
+                # every frame, rather than treating history as an unnormalized extra.
+                batch[name] = torch.from_numpy(history.copy()).unsqueeze(0)
         batch["task"] = [observation.task]
         batch["robot_type"] = self.robot_type
         return batch
+
+    def _prepare_observation(self, observation: ObservationSnapshot) -> dict[str, Any]:
+        prepared = self.preprocessor(self._batch(observation))
+        if observation.tactile_history is not None:
+            prepared["_runtime_tactile_history"] = True
+        return prepared
 
     def predict(
         self,
@@ -247,7 +270,7 @@ class PolicyRunner:
         mode = ExecutionMode(mode)
         if mode not in self.capabilities.modes:
             raise ValueError(f"Execution mode {mode.value!r} was not enabled by this deployment.")
-        prepared = self.preprocessor(self._batch(observation))
+        prepared = self._prepare_observation(observation)
         return self._predict_prepared(
             prepared,
             observation=observation,
@@ -264,7 +287,7 @@ class PolicyRunner:
         encoder = getattr(self.policy, "encode_prefix", None)
         if not callable(encoder):
             raise ValueError("The loaded policy does not expose split prefix encoding.")
-        prepared = self.preprocessor(self._batch(observation))
+        prepared = self._prepare_observation(observation)
         return prepared, encoder(prepared)
 
     def predict_from_prefix(
@@ -287,7 +310,7 @@ class PolicyRunner:
         # The VLM cache may intentionally lag behind the control stream. Build
         # a fresh FM batch from the current observation so dynamic conditions
         # such as tactile tokens are refreshed for every denoising invocation.
-        fm_prepared = self.preprocessor(self._batch(observation))
+        fm_prepared = self._prepare_observation(observation)
         if observation_delay_tokens is not None:
             fm_prepared["observation_delay_tokens"] = torch.tensor(
                 [observation_delay_tokens], dtype=torch.long

@@ -94,6 +94,8 @@ class ObservationSnapshot:
     observation_id: str = ""
     action_cursor: int | None = None
     execution_generation: int | None = None
+    tactile_history: Mapping[str, np.ndarray] | None = None
+    tactile_history_times: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         """Copy camera buffers so asynchronous encoding sees a stable frame."""
@@ -110,6 +112,23 @@ class ObservationSnapshot:
             array.setflags(write=False)
             owned[name] = array
         object.__setattr__(self, "features", MappingProxyType(owned))
+        if self.tactile_history is not None:
+            history = {}
+            length = None
+            for name, value in self.tactile_history.items():
+                array = np.array(value, copy=True, order="C")
+                if array.ndim < 1 or array.shape[0] < 1:
+                    raise ValueError("Tactile history must contain at least one frame")
+                if length is not None and length != array.shape[0]:
+                    raise ValueError("Tactile histories must have equal frame counts")
+                length = array.shape[0]
+                array.setflags(write=False)
+                history[name] = array
+            times = tuple(self.tactile_history_times)
+            if times and (len(times) != length or not all(math.isfinite(t) for t in times)):
+                raise ValueError("Tactile history timestamps must match its finite frame sequence")
+            object.__setattr__(self, "tactile_history", MappingProxyType(history))
+            object.__setattr__(self, "tactile_history_times", times)
 
 
 @dataclass(frozen=True)

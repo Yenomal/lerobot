@@ -361,3 +361,39 @@ def test_history_length_config_legacy_fallback_validation_and_round_trip(tmp_pat
     for name in ("fm_tactile_token_history_length", "vlm_tactile_token_history_length"):
         with pytest.raises(ValueError, match=f"{name} must be positive"):
             replace(legacy, **{name: 0})
+
+
+def test_runtime_external_history_skips_policy_queues_and_selects_branch_windows(make_model):
+    template = make_model(enabled=False, tactile=True)
+    model = VLAFlowMatching(
+        replace(
+            template.config,
+            use_vlm_tactile_token=True,
+            fm_tactile_token_history_length=2,
+            vlm_tactile_token_history_length=5,
+        )
+    )
+    policy = object.__new__(SmolVLAPolicy)
+    nn.Module.__init__(policy)
+    policy.config, policy.model = model.config, model
+    policy.prepare_images = lambda batch: ([], [])
+    policy.reset()
+    policy.eval()
+    batch = {k: torch.arange(5.0).reshape(1, 5, 1, 1, 1).expand(2, 5, 2, 3, 2) for k in inputs()}
+    batch["_runtime_tactile_history"] = True
+    batch.update(
+        {
+            "observation.state": torch.zeros(2, 6),
+            OBS_LANGUAGE_TOKENS: torch.ones(2, 2, dtype=torch.long),
+            OBS_LANGUAGE_ATTENTION_MASK: torch.ones(2, 2, dtype=torch.bool),
+        }
+    )
+    prepared = policy._prepare_batch(dict(batch), update_vlm_tactile_history=True)
+    assert not policy._tactile_history and not policy._vlm_tactile_history
+    fm_frames = model._tactile_frame_values(prepared)[0]
+    vlm_frames = model._tactile_frame_values(prepared, vlm=True)[0]
+    assert fm_frames[0, :, 0, 0, 0].tolist() == [3, 4]
+    assert vlm_frames[0, :, 0, 0, 0].tolist() == [0, 1, 2, 3, 4]
+    cache = policy.encode_prefix(dict(batch))
+    assert cache["prefix_pad_masks"].shape[1] == 8
+    assert not policy._tactile_history and not policy._vlm_tactile_history

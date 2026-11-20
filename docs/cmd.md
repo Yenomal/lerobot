@@ -43,6 +43,15 @@ prefix 时，process 模式通过进程间管道向 FM worker 提交一次 KV ca
 VLM 的旧 prepared batch 不再发送给 FM，FM 始终对当前 observation 做预处理。
 刷新会替换 FM 中的旧 cache；reset 或任务切换会清除缓存及标识，下次调用重新提交。
 
+触觉 history 由外部 RuntimeSession 统一采集：每个接受的新控制观测都追加一帧，
+包括当前只消费已缓存动作、没有执行 VLM/FM 的步骤；未确认动作的重放不重复追加。
+池容量为已启用分支所需历史长度的最大值，启动时用首帧补齐。VLM 编码和 FM 推理分别
+携带截至对应观测的固定历史快照，独立截取各自长度。local/process 两种模式均传递同一观测流
+中的历史，不再按 VLM 刷新或 FM 执行次数采样；reset、任务切换及断线后的新 session 清空 history。
+历史原始值使用 checkpoint 中同名触觉 feature 的 normalization，避免漏归一化或重复归一化。
+快照记录 Runtime 收帧的单调时间；这不替代传感器时间戳，也不自动重采样。
+客户端上报观测的频率仍应与训练数据的采样频率对齐，Runtime 无法补回没有上报的传感器帧。
+
 `--streaming-horizon` 默认取 `policy.chunk_size`，`--streaming-watermark` 默认在
 `policy.streaming_chunk_size` 个 action 后刷新 prefix。没有启用 `policy.streaming` 时，Runtime
 保持普通的单阶段 chunk 推理路径。
@@ -410,7 +419,7 @@ VLM prefix KV cache 和自身，所有 action token 都可以读取它；delay t
 
 当训练 batch 没有显式的 delay 字段时，policy 会按照配置的最大范围采样 delay；如果
 batch 含有 observation history，policy 会选择对应的历史帧。tactile token history 在
-训练时读取历史特征，在推理时由 policy 按 session 内的最近帧维护。
+训练时读取数据集历史，Runtime 推理时读取外部统一 history 的快照；直接 policy API 保留内部队列回退。
 
 开启 `use_tactile_token` 后，触觉不会写入 VLM prefix cache，而是在每次新的 FM inference
 调用开始时重新编码，并贯穿该次 denoising。触觉 MLP 为 `504 → 720 → 720`（UniVTAC 默认配置），
@@ -427,8 +436,8 @@ action 输入和位置条件。self-attention 中，`CA0` 与 `A0` 读取相同�
 `use_tactile_token_history=true` 时，每帧先独立经过 MLP，再经过两层因果空洞 TCN
 （dilation 1、2），最后一帧输出作为单个 tactile token（`H=1`）。
 `use_tactile_token_history=false` 时跳过 TCN，每帧 MLP 输出按从旧到新的顺序直接组成触觉 block，
-此时各侧 `H` 等于自己的历史长度。训练读取足以覆盖两侧历史及 VLM delay 的窗口，再独立截取；推理按 session
-维护同样长度的队列，启动时不足的历史用第一帧补齐，reset 后清空。
+此时各侧 `H` 等于自己的历史长度。训练读取足以覆盖两侧历史及 VLM delay 的窗口，再独立截取；Runtime 按 session
+维护可容纳两侧所需长度的共享池，启动时不足的历史用第一帧补齐，reset 后清空。
 所有触觉 token 使用 clean noise time；CA0 保持与 A0 相同的 noise/delay 条件和 RoPE 位置。
 action RoPE 从 A0 开始连续递增，CA0 复用 A0 位置，不额外占用一个位置。
 例如忽略 prefix/delay 的位置偏移，3 帧触觉的 `T0,T1,T2,CA0,A0,A1,A2` 位置为
@@ -490,10 +499,10 @@ VLM 侧额外经过 `vlm_tactile_projector: 720 → VLM hidden size`（默认 96
 后层触觉仍可能经图像/语言间接读取较新的触觉信息。若同时开启 `tactile_no_vlm_attention`，
 触觉不读取图像/语言，但图像/语言仍读取触觉。
 
-VLM 触觉及其对图像/语言的影响写入 KV cache，随 prefix 刷新；FM 触觉随每次新的 FM
-观测刷新。split Runtime 各自维护独立历史队列，以各自收到的观测为采样点；reset 清空两者，
-不足历史复制首帧。训练时 VLM 触觉历史与采样 delay 对应的图像/state 对齐，FM 保留最新历史。
-两边队列按各自长度维护；单进程完整推理同样分别维护两套历史。异步 prefix 刷新频率较低时，
-两边历史的实际时间间隔会不同。
+VLM 触觉及其对图像/语言的影响写入 KV cache，随 prefix 刷新；FM 使用当前观测的触觉。
+Runtime 统一维护原始触觉历史，再向 VLM/FM 提供对应观测时刻的快照，各侧独立截取自己的长度。
+VLM 低频刷新只影响缓存的新鲜程度，不改变历史帧的采样间隔。训练时 VLM 触觉历史与采样
+delay 对应的图像/state 对齐，FM 保留最新历史。不经过 Runtime 的直接 policy API 仍保留内部
+历史队列作为兼容路径；Runtime 提供历史窗口时不再更新内部队列。
 开启 VLM 触觉后普通 A0 也可通过 prefix 获取触觉，因此 CA0/A0 对比仅隔离额外的 FM 触觉路径。
 该模式默认关闭，不新增 Runtime CLI；按 checkpoint 配置自动加载，新增 VLM 编码器须训练。
