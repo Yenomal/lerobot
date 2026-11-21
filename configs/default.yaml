@@ -98,7 +98,10 @@ policy:
   use_tactile: false
   use_tactile_adarms: false  # AdaLN-Zero: per-layer RMSNorm scale/shift + zero residual gates.
   use_tactile_token: false
+  use_tactile_ca0: false  # True: CA0 isolation. False: first execution chunk reads FM tactile directly.
   use_vlm_tactile_token: false  # Independent 720-wide tactile MLP/TCN + projector in VLM prefix.
+  vlm_no_tactile_feedback: false  # Block other VLM tokens from reading the VLM tactile block.
+  fm_tactile_no_vlm_tactile_attention: false  # Block only FM tactile -> VLM tactile attention edges.
   use_tactile_cross_attention: false  # CA0 and the tactile block read live FM tactile K/V.
   use_tactile_cfg_gate: false
   use_tactile_reconstruction: false  # Frozen encoder/TCN output -> MLP -> current normalized tactile markers.

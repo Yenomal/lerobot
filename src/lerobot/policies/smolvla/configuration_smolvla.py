@@ -75,9 +75,15 @@ class SmolVLAConfig(PreTrainedConfig):
     # Legacy option name: per-layer RMSNorm scale/shift and zero residual gates.
     use_tactile_adarms: bool = False
     use_tactile_token: bool = False
+    # True: isolated CA0 branch. False: first execution chunk reads live FM tactile.
+    use_tactile_ca0: bool = False
     # Independent tactile encoder in the VLM prefix, appended after state.
     use_vlm_tactile_token: bool = False
-    # CA0 reads the live FM tactile block; its history tokens also read each other.
+    # VLM image/language/state queries cannot read the VLM tactile block.
+    vlm_no_tactile_feedback: bool = False
+    # FM tactile queries retain other prefix context, but cannot read VLM tactile K/V.
+    fm_tactile_no_vlm_tactile_attention: bool = False
+    # CA0 or first-chunk actions read live FM tactile K/V in cross-attention layers.
     use_tactile_cross_attention: bool = False
     # Learn CFG strength from the final FM tactile hidden state. Training
     # freezes the original policy and updates only this gate.
@@ -250,6 +256,12 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError("use_tactile_token requires use_tactile=True")
         if self.use_vlm_tactile_token and not self.use_tactile:
             raise ValueError("use_vlm_tactile_token requires use_tactile=True")
+        if self.vlm_no_tactile_feedback and not self.use_vlm_tactile_token:
+            raise ValueError("vlm_no_tactile_feedback requires use_vlm_tactile_token=True")
+        if self.fm_tactile_no_vlm_tactile_attention and not (
+            self.use_tactile_token and self.use_vlm_tactile_token
+        ):
+            raise ValueError("fm_tactile_no_vlm_tactile_attention requires both VLM and FM tactile tokens")
         if self.use_tactile_cross_attention and (
             not self.use_tactile_token or "cross" not in self.attention_mode
         ):
@@ -258,6 +270,8 @@ class SmolVLAConfig(PreTrainedConfig):
             )
         if self.use_tactile_cfg_gate and not self.use_tactile_token:
             raise ValueError("use_tactile_cfg_gate requires use_tactile_token=True")
+        if self.use_tactile_cfg_gate and not self.use_tactile_ca0:
+            raise ValueError("use_tactile_cfg_gate requires use_tactile_ca0=True")
         if self.use_tactile_reconstruction:
             if not self.use_tactile_token:
                 raise ValueError("use_tactile_reconstruction requires use_tactile_token=True")

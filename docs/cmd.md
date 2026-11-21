@@ -77,7 +77,8 @@ VLM 的旧 prepared batch 不再发送给 FM，FM 始终对当前 observation �
   `v_mean(A0) + tactile_cfg_lambda * (v(CA0) - v(A0))`，其中 `v_mean(A0)` 包含当前
   `v(A0)`；其它 chunk head 保持 `stream-head-mean` 逻辑。
 
-三个 tactile 模式只在启用 tactile token 且每次 FM 推理都提供 tactile observation 时可用。
+三个 tactile 模式要求 `use_tactile_token=true`、`use_tactile_ca0=true`，且每次 FM 推理提供 tactile observation。
+关闭 CA0 时使用 `stream` / `stream-head` / `stream-head-mean` 等普通模式，首个执行 chunk 直接读取 FM 触觉。
 临时消融实验参数 `--exp-random-tactile`（默认关闭）支持 local/process Runtime，要求 SmolVLA
 开启 tactile token。开启后在预处理完成的触觉空间，用独立的 `N(0,1)` 随机值替代左右触觉输入，
 每次新观测刷新，history 随随机帧维护，同次 denoising 复用；VLM prefix 不随机化。
@@ -260,7 +261,10 @@ policy:
   use_tactile: false
   use_tactile_adarms: false  # AdaLN-Zero: per-layer RMSNorm scale/shift + zero residual gates.
   use_tactile_token: false
+  use_tactile_ca0: false  # True: isolated CA0. False: first execution chunk reads FM tactile directly.
   use_vlm_tactile_token: false  # Independent tactile MLP/TCN and projector in the VLM prefix.
+  vlm_no_tactile_feedback: false  # Other VLM queries cannot read VLM tactile when true.
+  fm_tactile_no_vlm_tactile_attention: false  # FM tactile cannot read VLM tactile K/V when true.
   use_tactile_cross_attention: false  # CA0 and the tactile block read live FM tactile K/V.
   use_tactile_cfg_gate: false
   use_tactile_reconstruction: false
@@ -287,24 +291,26 @@ VLM query 的 softmax 保持原样。self/cross 层均生效，但 cross 层只�
 当前 delay token 没有加入 cross K/V；开启触觉 cross 路径后，CA0 的 cross 归一化包含 prefix 和 tactile。
 只有一个可见模态时，修正是 softmax 的常数平移，数学结果不变。
 
-让 `CA0` 在 cross-attention 层也能读取当前触觉，训练配置设置：
+让 FM 的触觉接收分支在 cross-attention 层也读取当前触觉，训练配置设置：
 
 ```yaml
 policy:
   use_tactile: true
   use_tactile_token: true
   use_tactile_cross_attention: true
+  use_tactile_ca0: true  # 原 CA0 隔离模式；false 则由首个执行 chunk 的 action 直接接收。
   use_tactile_adarms: false
 ```
 
 `use_tactile_cross_attention` 默认 `false`，要求 `attention_mode: cross_attn`。
 开启后，FM cross-attention 的 K/V 为「缓存的 VLM prefix + 当前 FM tactile block 的独立 K/V 投影」。
-每层投影整个 tactile block 的 hidden states，`CA0` 读取整个 block，触觉 query 按 block 内的双向/因果 mask 可见；
-`A0、A1…`、delay query 仍只读 prefix。self-attention 的触觉隔离 mask 保持原规则，
-普通动作也不能读取 `CA0`，防止触觉间接传播。
+每层投影整个 tactile block 的 hidden states，CA0 模式下 `CA0` 读取整个 block，
+无 CA0 模式下首个执行 chunk 的 action 读取 block。触觉 query 按 block 内的双向/因果 mask 可见；
+其余 action、delay query 仍只读 prefix。self-attention 采用相同的接收分支规则。
+CA0 模式下普通动作不能读取 `CA0`，防止经该分支间接接收 FM 触觉。
 触觉只随 FM 请求刷新，不加入 VLM token 或复用的 prefix KV cache，无需重跑 VLM。
 这条路径需要训练新增 K/V 投影（PEFT 下也会完整保存、训练），不增加 FM 前向次数。
-`CA0-A0` 保留触觉/无触觉对照。要让普通动作完全不接收触觉，还需保持
+CA0 模式的 `CA0-A0` 保留额外 FM 触觉路径的对照。要让普通动作不经独立触觉调制接收触觉，还需保持
 `use_tactile_adarms: false`，因为该独立调制路径会向所有 FM token 注入触觉。
 
 触觉重建探针训练可设置：
@@ -371,6 +377,13 @@ chunk 采样 `[epsilon, e]` 的连续 gate，并把 `ln(gate)` 作为跨 chunk �
 bias。`random_gate` 推理时使用 bidirectional attention。Pi05 的 `attention_gate` 和
 `learnable_gate` 不在 SmolVLA baseline 中实现。
 
+`streaming_attention_mode` 控制 action chunk 之间的关系，与触觉 block 内部的双向/因果
+attention 独立。开启 FM/VLM 触觉不会禁用 `random_gate`：随机 bias 只施加在 action→action
+的跨 chunk 边，同一 chunk 的 bias 为零；prefix、触觉、delay 的边不施加该 gate。
+开启 CA0 时，它继承 A0 对其他 action chunk 的 bias，并将 self key 换成 CA0，保持配套 mask 一致。
+在只有 prefix/live tactile K/V 的 cross-attention 层中，没有 action K/V，因此没有 action 跨 chunk
+gate 作用的边。原有触觉路由和隔离开关均保留。推理不采样随机 gate。
+
 旧编码下（`use_observation_delay_sincos=false`），开启 `use_observation_delay_adarms` 后，
 delay 经归一化和 MLP 编码，在 FM 每个 expert 层的
 attention 和 MLP 前分别生成 scale/shift，执行 `RMSNorm(h) * (1 + scale) + shift`。
@@ -424,12 +437,24 @@ batch 含有 observation history，policy 会选择对应的历史帧。tactile 
 开启 `use_tactile_token` 后，触觉不会写入 VLM prefix cache，而是在每次新的 FM inference
 调用开始时重新编码，并贯穿该次 denoising。触觉 MLP 为 `504 → 720 → 720`（UniVTAC 默认配置），
 隐藏层和输出层均跟随 FM expert hidden size，不再包含 `tactile_token_proj`。
-FM suffix 使用 `T0, ..., T(H-1), CA0, A0, A1, ...` 布局：`CA0` 复制 `A0` 的 noisy
+设置 `use_tactile_ca0=true` 时，FM suffix 使用 `T0, ..., T(H-1), CA0, A0, A1, ...` 布局：`CA0` 复制 `A0` 的 noisy
 action 输入和位置条件。self-attention 中，`CA0` 与 `A0` 读取相同的其他 action token
 （遵循 streaming attention mask），各自可以读取自己，但互不可见；只有 `CA0` 动作分支可以读取触觉 block。
 触觉 block 默认内部双向可见，只读取有效 prefix 和触觉 block，不读取 delay、CA0 或 action。
 其他 action 可以按原动作 mask 读取 `A0`，不能读取 `CA0` 或触觉 block，因此不会间接接收触觉。
 该隔离保证要求关闭独立的全 token 触觉调制 `use_tactile_adarms`。
+
+`use_tactile_ca0` 默认 `false`：不创建 CA0，suffix 为 `T0,...,T(H-1),A0,A1,...`。
+首个执行 chunk，即位置 `0..min(streaming_chunk_size, action_count)-1` 的 action，直接读取整个 FM
+触觉 block；其它 action 不直接读取 FM 触觉。上述首个 chunk 同时屏蔽 prefix 中的 VLM 触觉 token
+K/V，但仍读取图像、语言和 state。此规则按动作位置选择，不按浮点 timestep 是否等于 0.1 判断；
+例如 `streaming_chunk_size=5` 时接收分支是 A0–A4。
+这里屏蔽的是直接 attention 边：图文 K/V 可能已融合 VLM 触觉，其它 action 也可能通过 action–action
+attention 间接获得 FM 触觉。现有 action–action mask 保持不变。
+两种模式均保持原有触觉内部双向/因果 mask、TCN、历史长度、clean time 和 delay 控制。
+无 CA0 时 loss 仅为普通 action 的 flow-matching MSE，不增加 CA0 重建项或 CA0/A0 对比指标。
+`use_tactile_cfg_gate` 和三个 `stream-head-*-tactile*` 模式依赖 CA0，关闭时会明确报错。
+加载此前按 CA0 训练的 checkpoint 时需显式保持 `use_tactile_ca0=true`；新默认值不会自动推断旧训练语义。
 `fm_tactile_token_history_length` 和 `vlm_tactile_token_history_length` 分别指定两侧包含当前帧的历史长度。
 两者默认 `null`，各自回退到旧配置 `tactile_token_history_length`（默认 1），兼容已有实验与 checkpoint。
 显式设置任意一侧的新字段只覆盖该侧，另一侧保持自己的配置或兼容回退值。
@@ -488,6 +513,31 @@ policy:
 VLM prefix 顺序为 `[图像, 语言, state, VLM触觉block]`。触觉与图像/语言双向可见，
 触觉不读取 state；图像/语言继续不读取 state。state 保持原来的 prefix 可见关系，
 不直接读取后追加的触觉。有效帧和 padding mask 同时生效。
+
+若要切断两条触觉直接回流路径，可设置：
+
+```yaml
+policy:
+  use_tactile: true
+  use_vlm_tactile_token: true
+  use_tactile_token: true
+  use_tactile_ca0: false
+  vlm_no_tactile_feedback: true
+  fm_tactile_no_vlm_tactile_attention: true
+  tactile_no_vlm_attention: false
+```
+
+`vlm_no_tactile_feedback` 屏蔽所有 VLM 非触觉 query（图像、语言、state）读取 VLM 触觉 K/V。
+VLM 触觉仍可读取图像/语言及自身 block；原有触觉不读 state 的限制保留。
+`fm_tactile_no_vlm_tactile_attention` 仅屏蔽 FM 触觉 query 读取 VLM 触觉 K/V，
+保留 FM 触觉读取图像、语言、state prefix 的能力。两个开关默认 `false`，可独立控制；
+第一个要求 VLM 触觉开启，第二个要求两侧触觉都开启。训练和缓存推理的 self/cross 层均生效。
+`tactile_no_vlm_attention=true` 的范围更大，会继续屏蔽触觉读取整个 VLM 上下文。
+
+结合无 CA0 模式，首个执行 chunk 直接读 FM 触觉，后续 action 保持读取 VLM 触觉，
+两个触觉编码分支不再经上述两条直接边混合。这里只隔离指定的直接 attention 边：
+后续 action 和 delay token 仍可能读 VLM 触觉，再经原有 action–action 或 delay 路径传给首个 chunk；
+这些间接路径按实验要求保留，因此不承诺最终 action 表征的完全隔离。
 
 两分支独立控制历史长度，共享 TCN 开关与宽度、触觉内部因果开关和 `tactile_no_vlm_attention`，
 但 MLP/TCN 的参数完全独立。默认均为 `504 → 720 → 720`；TCN 输出也为 720 维，

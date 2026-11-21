@@ -128,6 +128,8 @@ def _validate_tactile_mode(runner: PolicyRunner, inference_mode: str) -> None:
         return
     if not getattr(runner.policy.config, "use_tactile_token", False):
         raise ValueError(f"{inference_mode} requires use_tactile_token=True")
+    if not getattr(runner.policy.config, "use_tactile_ca0", True):
+        raise ValueError(f"{inference_mode} requires use_tactile_ca0=True; use stream or stream-head without CA0")
     if not getattr(runner.policy.config, "streaming", False) or not all(
         callable(getattr(runner, method, None)) for method in ("encode_prefix", "predict_from_prefix")
     ):

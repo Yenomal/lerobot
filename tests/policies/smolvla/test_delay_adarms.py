@@ -95,6 +95,7 @@ def make_model(monkeypatch):
                 use_tactile=tactile or tactile_adarms,
                 use_tactile_adarms=tactile_adarms,
                 use_tactile_token=tactile,
+                use_tactile_ca0=True,
                 use_tactile_cross_attention=tactile_cross_attention,
                 use_modality_count_bias=modality_count_bias,
                 use_noise_embedding=use_noise_embedding,

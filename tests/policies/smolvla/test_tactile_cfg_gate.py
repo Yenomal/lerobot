@@ -60,7 +60,12 @@ def tactile_batch():
     ],
 )
 def test_gate_config_validation(overrides):
-    config = {"use_tactile": True, "use_tactile_token": True, "use_tactile_cfg_gate": True}
+    config = {
+        "use_tactile": True,
+        "use_tactile_token": True,
+        "use_tactile_ca0": True,
+        "use_tactile_cfg_gate": True,
+    }
     config.update(overrides)
     with pytest.raises(ValueError):
         SmolVLAConfig(**config)
