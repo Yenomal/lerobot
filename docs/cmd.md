@@ -260,6 +260,7 @@ policy:
   use_observation_delay_token: false
   use_tactile: false
   use_tactile_delta: false  # Raw current-baseline displacement, bypassing absolute marker normalization.
+  use_tactile_finger_tokens: false  # Separate finger tokens, learned left=0/right=1 embeddings.
   use_tactile_adarms: false  # AdaLN-Zero: per-layer RMSNorm scale/shift + zero residual gates.
   use_fm_tactile_token: false
   use_tactile_ca0: true  # Legacy CA0 isolation by default; false uses direct first-chunk tactile.
@@ -269,6 +270,7 @@ policy:
   vlm_context_reads_tactile: true  # Master permission for other VLM queries to read tactile.
   fm_tactile_reads_vlm_tactile: true  # True allows FM tactile to read VLM tactile K/V.
   use_tactile_cross_attention: false  # CA0 and the tactile block read live FM tactile K/V.
+  use_tactile_self_attention: true  # Action receiver reads FM tactile in self-attention layers.
   use_tactile_cfg_gate: false
   use_tactile_reconstruction: false
   tactile_reconstruction_hidden_dim: 256
@@ -306,6 +308,24 @@ policy:
 ```
 
 `use_tactile_cross_attention` 默认 `false`，要求 `attention_mode: cross_attn`。
+
+`use_tactile_self_attention` 默认 `true`，独立控制 self-attention 层中 action 接收分支
+读取 FM 触觉 K/V：CA0 开启时控制 CA0，关闭时控制首个执行 chunk 的 action。
+设为 `false` 只移除这些 self-attention 读取边，不改变触觉内部双向/因果 mask、触觉读取 prefix、
+action–action attention 或 VLM 侧触觉规则；cross-attention 使用自己的开关和原始路由 mask，
+不会因为关闭 self 路径而同时失效。旧 checkpoint 缺少新字段时保留 `true`。
+
+| use_tactile_self_attention | use_tactile_cross_attention | FM action 如何直接读取 FM 触觉 |
+|---|---|---|
+| true | false | 仅 self-attention 层（原默认） |
+| false | true | 仅 cross-attention 层 |
+| true | true | 两类层都读取 |
+| false | false | 不直接读取 FM 触觉；触觉内部编码仍执行 |
+
+这些开关启用已有层中的读取路径，不会增加 self/cross 层数；cross 层是否存在仍由
+`attention_mode` 和 `self_attn_every_n_layers` 决定。开启独立 `use_tactile_adarms` 时，
+即使两条 attention 读取路径都关闭，action 仍可通过触觉 AdaLN 调制接收信息。
+
 开启后，FM cross-attention 的 K/V 为「缓存的 VLM prefix + 当前 FM tactile block 的独立 K/V 投影」。
 每层投影整个 tactile block 的 hidden states，CA0 模式下 `CA0` 读取整个 block，
 无 CA0 模式下首个执行 chunk 的 action 读取 block。触觉 query 按 block 内的双向/因果 mask 可见；
@@ -462,7 +482,7 @@ attention 间接获得 FM 触觉。现有 action–action mask 保持不变。
 两者默认 `null`，各自回退到旧配置 `tactile_token_history_length`（默认 1），兼容已有实验与 checkpoint。
 显式设置任意一侧的新字段只覆盖该侧，另一侧保持自己的配置或兼容回退值。
 `use_tactile_token_history=true` 时，每帧先独立经过 MLP，再经过两层因果空洞 TCN
-（dilation 1、2），最后一帧输出作为单个 tactile token（`H=1`）。
+（dilation 1、2），最后一帧输出作为单个 tactile token（未拆指时 `H=1`，拆指时每指一个）。
 `use_tactile_token_history=false` 时跳过 TCN，每帧 MLP 输出按从旧到新的顺序直接组成触觉 block，
 此时各侧 `H` 等于自己的历史长度。训练读取足以覆盖两侧历史及 VLM delay 的窗口，再独立截取；Runtime 按 session
 维护可容纳两侧所需长度的共享池，启动时不足的历史用第一帧补齐，reset 后清空。
@@ -509,6 +529,31 @@ processor 对触觉坐标跳过原有绝对坐标的归一化，保留原始坐�
 state/action 等其余归一化不变。当前未额外估计位移的均值/标准差，位移重建 loss 的量纲也相应改变。
 数据集和 Runtime 仍提供原始 `[2,63,2]`，不在客户端提前计算位移。新模型须训练对应输入层，
 不能将 504 维输入的旧触觉 MLP 直接用于 252 维位移模式。旧 checkpoint 默认关闭该开关。
+
+单指独立 token 模式使用 `policy.use_tactile_finger_tokens: true`（默认 `false`）：
+
+```yaml
+policy:
+  use_tactile: true
+  use_tactile_delta: true
+  use_tactile_finger_tokens: true
+  use_fm_tactile_token: true
+  use_vlm_tactile_token: true
+```
+
+同一分支内，左右指共享同一个 MLP，逐指输入：位移模式每指 126 维，绝对坐标模式每指 252 维。
+左右指分别经过 MLP 和可选 TCN，TCN 沿各指自己的时间轴计算；VLM/FM 两侧的 MLP、TCN 和
+finger ID 表完全独立。各侧使用 `nn.Embedding(2, expert_hidden_size)`，左 ID=0，右 ID=1，
+将查表得到的向量加到该指 MLP/TCN 输出；VLM 侧随后再通过 VLM projector。
+
+历史长度仍按帧计数。关闭 TCN 时，各侧 `H` 帧生成 `2H` 个 token，排列为
+`L_old,R_old,...,L_current,R_current`；开启 TCN 时，分别融合左右指历史，得到 `L_current,R_current`
+两个 token。同帧左右指共享一个 RoPE 时间位置，finger embedding 区分左右；后续 action 的位置仍连续。
+触觉内部因果 mask 按帧执行：同一帧两指可互相读取，不能读取未来帧；双向模式整个触觉 block 互通。
+cross-attention、模态数量 bias、CA0/首 chunk 路由和 VLM 触觉隔离均按实际 token 数生效。
+CFG gate 读取最新左右两个 FM hidden 的均值；重建 probe 共用 decoder，分别重建当前左右指后合并 MSE；
+独立 tactile AdaLN 调制读取最新两指编码的均值。ID 表在 PEFT 下完整训练、保存。
+开启此模式改变 MLP 输入维度并增加 ID 参数，需训练对应参数，不能直接套用两指拼接模式的旧权重。
 
 VLM 侧触觉模式可单独开启，也可与 FM 触觉同时开启：
 
@@ -585,7 +630,8 @@ VLM 触觉仍可读取图像/语言及自身 block；是否读取 state 由 `vlm
 两分支独立控制历史长度，共享 TCN 开关与宽度、触觉内部因果开关和 `tactile_no_vlm_attention`，
 但 MLP/TCN 的参数完全独立。默认均为 `504 → 720 → 720`；TCN 输出也为 720 维，
 VLM 侧额外经过 `vlm_tactile_projector: 720 → VLM hidden size`（默认 960）。
-关闭 TCN 时两边各有对应历史长度的 token，开启时各自使用配置的历史帧并融合为一个。VLM 侧无 FM noise/delay AdaLN，
+未拆指时，关闭 TCN 两边各有对应历史长度的 token，开启时各融合为一个；拆指模式数量加倍。
+VLM 侧无 FM noise/delay AdaLN，
 使用普通 VLM RMSNorm；其 RoPE 位置在 state 后连续递增。
 
 `use_tactile_causal_attention` 只约束触觉 block 内部的直接边；当图像/语言与触觉双向交互时，

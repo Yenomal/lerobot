@@ -164,6 +164,7 @@ class SmolVLMWithExpertModel(nn.Module):
         use_noise_adarms: bool = False,
         use_tactile_adarms: bool = False,
         use_tactile_cross_attention: bool = False,
+        use_tactile_self_attention: bool = True,
         use_modality_count_bias: bool = False,
     ):
         super().__init__()
@@ -273,6 +274,7 @@ class SmolVLMWithExpertModel(nn.Module):
         self.train_expert_only = train_expert_only
         self.attention_mode = attention_mode
         self.use_modality_count_bias = use_modality_count_bias
+        self.use_tactile_self_attention = use_tactile_self_attention
         self.expert_hidden_size = lm_expert_config.hidden_size
         self.set_requires_grad()
 
@@ -458,6 +460,8 @@ class SmolVLMWithExpertModel(nn.Module):
         delay_modulation_mask: torch.Tensor | None = None,
         tactile_condition: torch.Tensor | None = None,
         auxiliary_token_count: int = 0,
+        tactile_token_index: int | None = None,
+        tactile_token_count: int = 1,
     ) -> "tuple[list[torch.Tensor], DynamicCache | None]":
         query_states = []
         key_states = []
@@ -523,6 +527,25 @@ class SmolVLMWithExpertModel(nn.Module):
             )
             key_states = key_states.transpose(1, 2)
             value_states = value_states.transpose(1, 2)
+
+        if (
+            not self.use_tactile_self_attention
+            and tactile_token_index is not None
+            and inputs_embeds[1] is not None
+            and model_layers[1][layer_idx] is not None
+        ):
+            suffix_length = inputs_embeds[1].shape[1]
+            query_start = query_states.shape[1] - suffix_length
+            key_start = key_states.shape[1] - suffix_length
+            tactile_end = tactile_token_index + tactile_token_count
+            # Keep tactile's own time mask and prefix reads. Only action/CA0
+            # reads of live tactile are disabled, on this layer's private mask.
+            attention_mask_ = attention_mask_.clone()
+            attention_mask_[
+                :,
+                query_start + tactile_end :,
+                key_start + tactile_token_index : key_start + tactile_end,
+            ] = False
 
         if (
             self.use_modality_count_bias
@@ -797,6 +820,8 @@ class SmolVLMWithExpertModel(nn.Module):
                     delay_modulation_mask=delay_modulation_mask,
                     tactile_condition=tactile_condition,
                     auxiliary_token_count=auxiliary_token_count,
+                    tactile_token_index=tactile_token_index,
+                    tactile_token_count=tactile_token_count,
                 )
             else:
                 att_outputs, past_key_values = self.forward_cross_attn_layer(

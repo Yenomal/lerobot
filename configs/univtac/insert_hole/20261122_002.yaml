@@ -15,3 +15,4 @@ policy:
   use_tactile_delta: true
   fm_tactile_token_history_length: 5
   use_modality_count_bias: true
+  use_tactile_ca0: true

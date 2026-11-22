@@ -74,6 +74,8 @@ class SmolVLAConfig(PreTrainedConfig):
     use_tactile: bool = False
     # Encode raw current-minus-baseline marker displacement instead of both coordinates.
     use_tactile_delta: bool = False
+    # One token per finger, with shared per-branch encoder and learned finger IDs.
+    use_tactile_finger_tokens: bool = False
     # Legacy option name: per-layer RMSNorm scale/shift and zero residual gates.
     use_tactile_adarms: bool = False
     use_fm_tactile_token: bool = False
@@ -91,6 +93,8 @@ class SmolVLAConfig(PreTrainedConfig):
     fm_tactile_reads_vlm_tactile: bool = True
     # CA0 or first-chunk actions read live FM tactile K/V in cross-attention layers.
     use_tactile_cross_attention: bool = False
+    # Action receivers read live FM tactile K/V in self-attention layers.
+    use_tactile_self_attention: bool = True
     # Learn CFG strength from the final FM tactile hidden state. Training
     # freezes the original policy and updates only this gate.
     use_tactile_cfg_gate: bool = False
@@ -260,6 +264,8 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError("use_tactile_adarms requires use_tactile=True")
         if self.use_tactile_delta and not self.use_tactile:
             raise ValueError("use_tactile_delta requires use_tactile=True")
+        if self.use_tactile_finger_tokens and not self.use_tactile:
+            raise ValueError("use_tactile_finger_tokens requires use_tactile=True")
         if self.use_fm_tactile_token and not self.use_tactile:
             raise ValueError("use_fm_tactile_token requires use_tactile=True")
         if self.use_vlm_tactile_token and not self.use_tactile:

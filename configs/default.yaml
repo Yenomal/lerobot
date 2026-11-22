@@ -97,6 +97,7 @@ policy:
   use_observation_delay_token: false
   use_tactile: false
   use_tactile_delta: false  # Raw current-baseline displacement; bypass absolute-coordinate normalization.
+  use_tactile_finger_tokens: false  # Separate left/right tokens; learned finger IDs 0/1 per branch.
   use_tactile_adarms: false  # AdaLN-Zero: per-layer RMSNorm scale/shift + zero residual gates.
   use_fm_tactile_token: false
   use_tactile_ca0: true  # Legacy CA0 isolation by default; false routes FM tactile to the first chunk.
@@ -106,6 +107,7 @@ policy:
   vlm_context_reads_tactile: true  # Master permission for non-tactile VLM queries to read tactile.
   fm_tactile_reads_vlm_tactile: true  # Allow FM tactile queries to read VLM tactile K/V.
   use_tactile_cross_attention: false  # CA0 and the tactile block read live FM tactile K/V.
+  use_tactile_self_attention: true  # CA0/first-chunk action reads FM tactile in self-attention layers.
   use_tactile_cfg_gate: false
   use_tactile_reconstruction: false  # Frozen encoder/TCN output -> MLP -> current normalized tactile markers.
   tactile_reconstruction_hidden_dim: 256
