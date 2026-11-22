@@ -32,8 +32,8 @@ def test_flags_masks_cache_parity_and_hidden_invariance(
             template.config,
             use_vlm_tactile_token=True,
             use_tactile_ca0=False,
-            vlm_no_tactile_feedback=no_feedback,
-            fm_tactile_no_vlm_tactile_attention=no_fm_read,
+            vlm_context_reads_tactile=not (no_feedback),
+            fm_tactile_reads_vlm_tactile=not (no_fm_read),
             use_tactile_token_history=tcn,
             fm_tactile_token_history_length=3,
             vlm_tactile_token_history_length=2,
@@ -113,23 +113,23 @@ def test_flags_masks_cache_parity_and_hidden_invariance(
 def test_circuit_flags_round_trip_and_validation(tmp_path):
     config = SmolVLAConfig(
         use_tactile=True,
-        use_tactile_token=True,
+        use_fm_tactile_token=True,
         use_vlm_tactile_token=True,
-        vlm_no_tactile_feedback=True,
-        fm_tactile_no_vlm_tactile_attention=True,
+        vlm_context_reads_tactile=False,
+        fm_tactile_reads_vlm_tactile=False,
     )
     config.save_pretrained(tmp_path)
     loaded = SmolVLAConfig.from_pretrained(tmp_path)
-    assert loaded.vlm_no_tactile_feedback and loaded.fm_tactile_no_vlm_tactile_attention
-    assert not SmolVLAConfig().vlm_no_tactile_feedback
-    assert not SmolVLAConfig().fm_tactile_no_vlm_tactile_attention
-    with pytest.raises(ValueError, match="vlm_no_tactile_feedback requires"):
-        SmolVLAConfig(vlm_no_tactile_feedback=True)
+    assert not (loaded.vlm_context_reads_tactile) and not (loaded.fm_tactile_reads_vlm_tactile)
+    assert SmolVLAConfig().vlm_context_reads_tactile
+    assert SmolVLAConfig().fm_tactile_reads_vlm_tactile
+    with pytest.raises(ValueError, match="vlm_context_reads_tactile requires"):
+        SmolVLAConfig(vlm_context_reads_tactile=False)
     for fm, vlm in ((False, True), (True, False)):
         with pytest.raises(ValueError, match="requires both VLM and FM"):
             SmolVLAConfig(
                 use_tactile=True,
-                use_tactile_token=fm,
+                use_fm_tactile_token=fm,
                 use_vlm_tactile_token=vlm,
-                fm_tactile_no_vlm_tactile_attention=True,
+                fm_tactile_reads_vlm_tactile=False,
             )

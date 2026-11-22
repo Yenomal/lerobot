@@ -211,7 +211,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
         was_training = self.training
         self.eval()
         with torch.no_grad():
-            flat = torch.cat([value.flatten(1) for value in tactile_batch.values()], dim=-1)
+            flat = torch.cat(
+                [self.model._tactile_marker_values(value).flatten(1) for value in tactile_batch.values()],
+                dim=-1,
+            )
             for encoder in pending:
                 encoder(flat.to(encoder[0].weight.dtype))
         if was_training:
@@ -224,7 +227,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         initialize_lazy = getattr(model, "initialize_lazy_parameters", None)
         if callable(initialize_lazy):
             initialize_lazy()
-        if getattr(model.config, "use_tactile_token", False):
+        if getattr(model.config, "use_fm_tactile_token", False):
             # model_file identifies the weights actually loaded, including
             # resumed/EMA checkpoints; config.pretrained_path may name a base model.
             model.model._tactile_cfg_lambda_logger = TactileCFGLambdaLogger(Path(model_file).parent)
@@ -519,7 +522,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         if (
             update_tactile_history
             and self.config.use_tactile
-            and (self.config.use_tactile_token or getattr(self.config, "use_vlm_tactile_token", False))
+            and (self.config.use_fm_tactile_token or getattr(self.config, "use_vlm_tactile_token", False))
             and not self.training
         ):
             for side in ("left", "right"):
@@ -550,7 +553,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                         )
                     )
                 else:
-                    if self.config.use_tactile_token:
+                    if self.config.use_fm_tactile_token:
                         stores.append(
                             (self._tactile_history, self.config.get_tactile_history_length(), "_history")
                         )
@@ -573,8 +576,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     def enable_random_tactile_experiment(self) -> None:
         """Replace normalized tactile observations for a runtime-only ablation."""
-        if not self.config.use_tactile_token:
-            raise ValueError("--exp-random-tactile requires use_tactile_token=True")
+        if not self.config.use_fm_tactile_token:
+            raise ValueError("--exp-random-tactile requires use_fm_tactile_token=True")
         self._exp_random_tactile = True
         self.model._exp_random_tactile = True
         self._random_tactile_generators = {}
@@ -722,7 +725,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             raise ValueError("SmolVLA requires an action output feature.")
         if not self.config.use_tactile_reconstruction:
             losses = losses[:, :, : action_feature.shape[0]]
-        if self.config.use_tactile_token:
+        if self.config.use_fm_tactile_token:
             diagnostics = getattr(self.model, "_last_tactile_training_errors", None)
             if diagnostics is not None:
                 valid = (
@@ -1176,6 +1179,10 @@ class VLAFlowMatching(nn.Module):
                         f"Tactile reconstruction requires a resolved {side} tactile input feature"
                     )
                 tactile_width += math.prod(features[key].shape)
+                if self.config.use_tactile_delta and features[key].shape[0] != 2:
+                    raise ValueError("use_tactile_delta requires per-finger shape [2, markers, 2]")
+            if self.config.use_tactile_delta:
+                tactile_width //= 2
             self.tactile_reconstruction = nn.Sequential(
                 nn.Linear(self.vlm_with_expert.expert_hidden_size, config.tactile_reconstruction_hidden_dim),
                 nn.SiLU(),
@@ -1357,7 +1364,7 @@ class VLAFlowMatching(nn.Module):
             if vlm and f"{key}_vlm_history" in batch:
                 history_key = f"{key}_vlm_history"
             use_history = (
-                self.config.use_tactile_token
+                self.config.use_fm_tactile_token
                 or self.config.use_tactile_token_history
                 or getattr(self.config, "use_vlm_tactile_token", False)
             )
@@ -1408,12 +1415,20 @@ class VLAFlowMatching(nn.Module):
             values.append(value)
         return values[0], values[1]
 
+    def _tactile_marker_values(self, value: Tensor) -> Tensor:
+        """Convert raw [baseline, current] coordinates to displacement when configured."""
+        if not getattr(self.config, "use_tactile_delta", False):
+            return value
+        if value.ndim < 3 or value.shape[-3] != 2 or value.shape[-1] != 2:
+            raise ValueError("use_tactile_delta requires marker shape [..., 2, markers, 2]")
+        return value[..., 1, :, :] - value[..., 0, :, :]
+
     def _encode_tactile_frames(self, batch, *, vlm: bool = False) -> Tensor:
         """Encode each tactile frame independently before temporal fusion."""
         enabled = (
             getattr(self.config, "use_vlm_tactile_token", False)
             if vlm
-            else (self.config.use_tactile_token or self.config.use_tactile_adarms)
+            else (self.config.use_fm_tactile_token or self.config.use_tactile_adarms)
         )
         if not self.config.use_tactile or not enabled:
             return None
@@ -1422,7 +1437,13 @@ class VLAFlowMatching(nn.Module):
             raise RuntimeError("Tactile encoder was not initialized")
         left, right = self._tactile_frame_values(batch, vlm=vlm)
         batch_size, history = left.shape[:2]
-        frame_tactile = torch.cat([left.flatten(start_dim=2), right.flatten(start_dim=2)], dim=-1)
+        frame_tactile = torch.cat(
+            [
+                self._tactile_marker_values(left).flatten(start_dim=2),
+                self._tactile_marker_values(right).flatten(start_dim=2),
+            ],
+            dim=-1,
+        )
         flattened = frame_tactile.reshape(batch_size * history, -1)
         first_layer = encoder[0]
         expected_width = getattr(first_layer, "in_features", None)
@@ -1458,7 +1479,7 @@ class VLAFlowMatching(nn.Module):
         return frames
 
     def _tactile_token_count(self, embedding: Tensor | None) -> int:
-        if embedding is None or not self.config.use_tactile_token:
+        if embedding is None or not self.config.use_fm_tactile_token:
             return 0
         return embedding.shape[1] if embedding.ndim == 3 else 1
 
@@ -1839,7 +1860,7 @@ class VLAFlowMatching(nn.Module):
     def _apply_vlm_tactile_prefix_mask(
         self, attention_mask: Tensor, prefix_pad_masks: Tensor, prefix_att_masks: Tensor
     ) -> Tensor:
-        """Configure VLM tactile edges while hiding state from tactile; keep suffix visibility."""
+        """Configure VLM tactile/context edges; keep suffix visibility unchanged."""
         if not getattr(self.config, "use_vlm_tactile_token", False):
             return attention_mask
         count = prefix_pad_masks.shape[1]
@@ -1853,12 +1874,17 @@ class VLAFlowMatching(nn.Module):
             internal = internal & torch.ones(count, count, dtype=torch.bool, device=prefix_mask.device).tril()
         reads = internal
         if not self.config.tactile_no_vlm_attention:
-            reads = reads | (tactile_rows & image_language[:, None, :])
+            context = image_language
+            if getattr(self.config, "vlm_tactile_reads_state", False):
+                context = context | (prefix_att_masks == 1)
+            reads = reads | (tactile_rows & context[:, None, :])
         prefix_mask = torch.where(tactile_rows, reads, prefix_mask)
-        if getattr(self.config, "vlm_no_tactile_feedback", False):
+        if not getattr(self.config, "vlm_context_reads_tactile", True):
             prefix_mask = prefix_mask & ~(~tactile_rows & tactile_keys)
         else:
             prefix_mask = prefix_mask | (image_language[:, :, None] & tactile_keys)
+            if getattr(self.config, "vlm_state_reads_tactile", False):
+                prefix_mask = prefix_mask | ((prefix_att_masks == 1)[:, :, None] & tactile_keys)
         prefix_mask = prefix_mask & prefix_pad_masks[:, :, None] & prefix_pad_masks[:, None, :]
         result = attention_mask.clone()
         result[:, :count, :count] = prefix_mask
@@ -1932,7 +1958,7 @@ class VLAFlowMatching(nn.Module):
         # The tactile suffix is ``T0..T(H-1), CA0, A0, A1, ...``. CA0 is a
         # copy of A0 with the same noisy input and timestep condition, but its
         # attention row is isolated so only CA0 consumes tactile context.
-        use_tactile_token = tactile_embedding is not None and self.config.use_tactile_token
+        use_fm_tactile_token = tactile_embedding is not None and self.config.use_fm_tactile_token
         use_delay_token = self.observation_delay_token_embedding is not None
         action_tokens = action_time_emb
         action_att_masks = self._action_att_masks(bsize, device, torch.bool)
@@ -1949,7 +1975,7 @@ class VLAFlowMatching(nn.Module):
             embs.append(delay_token)
             pad_masks.append(torch.ones(bsize, count, dtype=torch.bool, device=device))
             att_masks += [1] + [0] * (count - 1)
-        if use_tactile_token:
+        if use_fm_tactile_token:
             tactile_token = (
                 tactile_embedding[:, None, :] if tactile_embedding.ndim == 2 else tactile_embedding
             ).to(dtype=action_time_emb.dtype)
@@ -2115,13 +2141,19 @@ class VLAFlowMatching(nn.Module):
                 raise ValueError("Tactile reconstruction training requires a tactile observation")
             assert self.tactile_reconstruction is not None
             # Probe the frozen tactile encoder directly, before any FM processing.
-            # Inputs have already been normalized by the policy preprocessor.
+            # Absolute coordinates are normalized; delta mode retains raw coordinates.
             with torch.no_grad():
                 tactile_embedding = self._encode_tactile(tactile_batch)
                 if tactile_embedding.ndim == 3:
                     tactile_embedding = tactile_embedding[:, -1]
                 left, right = self._tactile_frame_values(tactile_batch)
-                target = torch.cat([left[:, -1].flatten(1), right[:, -1].flatten(1)], dim=-1)
+                target = torch.cat(
+                    [
+                        self._tactile_marker_values(left[:, -1]).flatten(1),
+                        self._tactile_marker_values(right[:, -1]).flatten(1),
+                    ],
+                    dim=-1,
+                )
             prediction = self.tactile_reconstruction(
                 tactile_embedding.detach().to(self.tactile_reconstruction[0].weight.dtype)
             )
@@ -2184,7 +2216,7 @@ class VLAFlowMatching(nn.Module):
                 + (tactile_count + int(self._use_tactile_ca0()) if tactile_count else 0),
                 delay_token_count=delay_token_count,
             )
-        if tactile_embedding is not None and self.config.use_tactile_token:
+        if tactile_embedding is not None and self.config.use_fm_tactile_token:
             att_2d_masks = self._apply_tactile_token_mask(
                 att_2d_masks,
                 prefix_len=prefix_pad_masks.shape[1],
@@ -2193,7 +2225,7 @@ class VLAFlowMatching(nn.Module):
                 tactile_token_count=tactile_count,
                 causal=getattr(self.config, "use_tactile_causal_attention", False),
                 read_prefix=not getattr(self.config, "tactile_no_vlm_attention", False),
-                read_vlm_tactile=not getattr(self.config, "fm_tactile_no_vlm_tactile_attention", False),
+                read_vlm_tactile=getattr(self.config, "fm_tactile_reads_vlm_tactile", True),
                 use_ca0=self._use_tactile_ca0(),
                 tactile_action_count=getattr(self.config, "streaming_chunk_size", self.config.chunk_size),
                 prefix_tactile_mask=prefix_att_masks == 2,
@@ -2214,7 +2246,7 @@ class VLAFlowMatching(nn.Module):
                 include_ca0=bool(tactile_count and self._use_tactile_ca0()),
             )
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        if tactile_embedding is not None and self.config.use_tactile_token and self._use_tactile_ca0():
+        if tactile_embedding is not None and self.config.use_fm_tactile_token and self._use_tactile_ca0():
             action0_index = prefix_pad_masks.shape[1] + tactile_count + 1
             if self.observation_delay_token_embedding is not None:
                 action0_index += delay_token_count
@@ -2227,7 +2259,9 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[prefix_embs, suffix_embs],
             auxiliary_token_count=delay_token_count + tactile_count,
             tactile_token_index=(
-                delay_token_count if tactile_embedding is not None and self.config.use_tactile_token else None
+                delay_token_count
+                if tactile_embedding is not None and self.config.use_fm_tactile_token
+                else None
             ),
             tactile_token_count=tactile_count,
             tactile_condition=tactile_condition,
@@ -2260,7 +2294,7 @@ class VLAFlowMatching(nn.Module):
             return F.mse_loss(fused, u_t[:, 0], reduction="none")[:, None, :]
         copy_out = (
             suffix_out[:, -(self.config.chunk_size + 1)]
-            if tactile_embedding is not None and self.config.use_tactile_token and self._use_tactile_ca0()
+            if tactile_embedding is not None and self.config.use_fm_tactile_token and self._use_tactile_ca0()
             else None
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :]
@@ -2270,7 +2304,7 @@ class VLAFlowMatching(nn.Module):
         losses = F.mse_loss(u_t, v_t, reduction="none")
         if copy_out is not None:
             copy_v_t = self.action_out_proj(copy_out.to(dtype=torch.float32))
-            if self.config.use_tactile_token:
+            if self.config.use_fm_tactile_token:
                 self._record_tactile_training_errors(v_t[:, 0], copy_v_t, u_t[:, 0])
             copy_loss = F.mse_loss(copy_v_t, u_t[:, 0], reduction="none")
             losses[:, 0] = 0.5 * (losses[:, 0] + copy_loss)
@@ -2581,8 +2615,8 @@ class VLAFlowMatching(nn.Module):
             "stream-head-tactile-cfg",
             "stream-head-mean-tactile-cfg",
         )
-        if tactile_mode and not self.config.use_tactile_token:
-            raise ValueError(f"{inference_mode} requires use_tactile_token=True")
+        if tactile_mode and not self.config.use_fm_tactile_token:
+            raise ValueError(f"{inference_mode} requires use_fm_tactile_token=True")
         if tactile_mode and not self._use_tactile_ca0():
             raise ValueError(
                 f"{inference_mode} requires use_tactile_ca0=True; use stream or stream-head without CA0"
@@ -2904,7 +2938,7 @@ class VLAFlowMatching(nn.Module):
                 query_offset=prefix_len,
                 delay_token_count=delay_token_count,
             )
-        if tactile_embedding is not None and self.config.use_tactile_token:
+        if tactile_embedding is not None and self.config.use_fm_tactile_token:
             full_att_2d_masks = self._apply_tactile_token_mask(
                 full_att_2d_masks,
                 prefix_len=prefix_len,
@@ -2914,14 +2948,14 @@ class VLAFlowMatching(nn.Module):
                 tactile_token_count=tactile_count,
                 causal=getattr(self.config, "use_tactile_causal_attention", False),
                 read_prefix=not getattr(self.config, "tactile_no_vlm_attention", False),
-                read_vlm_tactile=not getattr(self.config, "fm_tactile_no_vlm_tactile_attention", False),
+                read_vlm_tactile=getattr(self.config, "fm_tactile_reads_vlm_tactile", True),
                 use_ca0=self._use_tactile_ca0(),
                 tactile_action_count=getattr(self.config, "streaming_chunk_size", self.config.chunk_size),
                 prefix_tactile_mask=self._prefix_tactile_keys(prefix_pad_masks),
             )
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
-        if tactile_embedding is not None and self.config.use_tactile_token and self._use_tactile_ca0():
+        if tactile_embedding is not None and self.config.use_fm_tactile_token and self._use_tactile_ca0():
             action0_index = tactile_count + 1
             if self.observation_delay_token_embedding is not None:
                 action0_index += delay_token_count
@@ -2934,7 +2968,9 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[None, suffix_embs],
             auxiliary_token_count=delay_token_count + tactile_count,
             tactile_token_index=(
-                delay_token_count if tactile_embedding is not None and self.config.use_tactile_token else None
+                delay_token_count
+                if tactile_embedding is not None and self.config.use_fm_tactile_token
+                else None
             ),
             tactile_token_count=tactile_count,
             tactile_condition=tactile_condition,
@@ -2972,8 +3008,8 @@ class VLAFlowMatching(nn.Module):
         if return_tactile_copy:
             if not self._use_tactile_ca0():
                 raise ValueError("return_tactile_copy requires use_tactile_ca0=True")
-            if tactile_embedding is None or not self.config.use_tactile_token:
-                raise ValueError("return_tactile_copy requires use_tactile_token=True and tactile input")
+            if tactile_embedding is None or not self.config.use_fm_tactile_token:
+                raise ValueError("return_tactile_copy requires use_fm_tactile_token=True and tactile input")
             tactile_copy_out = suffix_out[:, -(x_t.shape[1] + 1)]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)

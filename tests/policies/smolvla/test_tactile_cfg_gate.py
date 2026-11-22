@@ -52,7 +52,7 @@ def tactile_batch():
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"use_tactile_token": False},
+        {"use_fm_tactile_token": False},
         {"tactile_cfg_gate_hidden_dim": 0},
         {"tactile_cfg_lambda_init": 0.0},
         {"tactile_cfg_lambda_init": 2.0},
@@ -62,7 +62,7 @@ def tactile_batch():
 def test_gate_config_validation(overrides):
     config = {
         "use_tactile": True,
-        "use_tactile_token": True,
+        "use_fm_tactile_token": True,
         "use_tactile_ca0": True,
         "use_tactile_cfg_gate": True,
     }
@@ -242,7 +242,7 @@ def test_stream_head_uses_per_sample_gate_only_for_cfg(mode):
     nn.Module.__init__(model)
     model.config = SimpleNamespace(
         use_tactile_cfg_gate=True,
-        use_tactile_token=True,
+        use_fm_tactile_token=True,
         chunk_size=2,
         streaming=True,
         streaming_chunk_size=2,
@@ -349,7 +349,7 @@ def test_random_tactile_changes_ca0_but_preserves_raw_fields_and_action_rng(gate
 def test_random_tactile_requires_token_policy(gate_model):
     policy = object.__new__(SmolVLAPolicy)
     nn.Module.__init__(policy)
-    policy.config = replace(gate_model.config, use_tactile_token=False, use_tactile_cfg_gate=False)
+    policy.config = replace(gate_model.config, use_fm_tactile_token=False, use_tactile_cfg_gate=False)
     policy.model = gate_model
-    with pytest.raises(ValueError, match="requires use_tactile_token"):
+    with pytest.raises(ValueError, match="requires use_fm_tactile_token"):
         policy.enable_random_tactile_experiment()

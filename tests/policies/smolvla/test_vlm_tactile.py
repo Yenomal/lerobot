@@ -33,7 +33,7 @@ def test_independent_encoders_prefix_mask_cache_parity_and_gradients(make_model,
         replace(
             template.config,
             use_vlm_tactile_token=True,
-            use_tactile_token=fm,
+            use_fm_tactile_token=fm,
             use_tactile_token_history=tcn,
             use_tactile_causal_attention=causal,
             tactile_token_history_length=3,
@@ -128,7 +128,7 @@ def test_lazy_initialization_checkpoint_and_config(make_model, tmp_path):
     config = replace(
         template.config,
         use_vlm_tactile_token=True,
-        use_tactile_token=False,
+        use_fm_tactile_token=False,
         use_tactile_token_history=True,
         tactile_token_history_length=3,
     )
@@ -151,7 +151,7 @@ def test_lazy_initialization_checkpoint_and_config(make_model, tmp_path):
     SmolVLAPolicy._load_as_safetensor(policy, file, "cpu", True)
     config.save_pretrained(tmp_path)
     loaded = SmolVLAConfig.from_pretrained(tmp_path)
-    assert loaded.use_vlm_tactile_token and not loaded.use_tactile_token
+    assert loaded.use_vlm_tactile_token and not loaded.use_fm_tactile_token
     assert loaded.use_tactile_token_history
     assert "vlm_tactile_projector" in policy._get_default_peft_targets()["target_modules"]
     with pytest.raises(ValueError, match="use_vlm_tactile_token requires"):
@@ -227,7 +227,7 @@ def test_vlm_tactile_bf16_autocast_forward_and_backward(make_model, fm, tcn):
         replace(
             template.config,
             use_vlm_tactile_token=True,
-            use_tactile_token=fm,
+            use_fm_tactile_token=fm,
             use_tactile_token_history=tcn,
             tactile_token_history_length=3,
         )

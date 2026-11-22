@@ -11,7 +11,7 @@ policy:
   observation_delay_max_tokens: 20
   use_observation_delay_adaln_zero: true
   use_tactile: true
-  use_tactile_token: true
+  use_fm_tactile_token: true
   use_tactile_token_history: true
   tactile_token_history_length: 7
   use_tactile_causal_attention: false

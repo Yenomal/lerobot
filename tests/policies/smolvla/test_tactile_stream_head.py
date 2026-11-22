@@ -20,7 +20,7 @@ def test_tactile_guidance_changes_only_position_zero_and_preserves_raw_history(m
     model = VLAFlowMatching.__new__(VLAFlowMatching)
     torch.nn.Module.__init__(model)
     model.config = SimpleNamespace(
-        chunk_size=6, streaming=True, streaming_chunk_size=3, action_dim=2, use_tactile_token=True
+        chunk_size=6, streaming=True, streaming_chunk_size=3, action_dim=2, use_fm_tactile_token=True
     )
     model.tactile_adarms = None
     model._encode_tactile = lambda batch: torch.ones(2, 2)
@@ -58,12 +58,12 @@ def test_tactile_guidance_changes_only_position_zero_and_preserves_raw_history(m
 def test_tactile_modes_require_enabled_token_and_observation(mode, entrypoint):
     model = VLAFlowMatching.__new__(VLAFlowMatching)
     torch.nn.Module.__init__(model)
-    model.config = SimpleNamespace(use_tactile_token=False, chunk_size=6, action_dim=2)
+    model.config = SimpleNamespace(use_fm_tactile_token=False, chunk_size=6, action_dim=2)
     prefix = {"prefix_pad_masks": torch.ones(1, 1, dtype=torch.bool), "past_key_values": None}
     kwargs = {"noise": torch.zeros(1, 6, 2), "inference_mode": mode}
-    with pytest.raises(ValueError, match="requires use_tactile_token=True"):
+    with pytest.raises(ValueError, match="requires use_fm_tactile_token=True"):
         getattr(model, entrypoint)(prefix, **kwargs)
-    model.config.use_tactile_token = True
+    model.config.use_fm_tactile_token = True
     with pytest.raises(ValueError, match="requires a tactile observation"):
         getattr(model, entrypoint)(prefix, **kwargs)
 
@@ -75,7 +75,7 @@ def test_denoise_returns_ca0_separately_with_or_without_delay_token(delay, cache
 
     model = VLAFlowMatching.__new__(VLAFlowMatching)
     torch.nn.Module.__init__(model)
-    model.config = SimpleNamespace(chunk_size=3, use_tactile_token=True, use_cache=cached)
+    model.config = SimpleNamespace(chunk_size=3, use_fm_tactile_token=True, use_cache=cached)
     model.observation_delay_token_embedding = object() if delay else None
     model.observation_delay_adarms = None
     # Expert outputs use distinct values for T, CA0 and the real actions.
@@ -128,7 +128,7 @@ def test_tactile_modes_initialize_and_carry_action_history_across_steps(mode, ex
         streaming_chunk_size=5,
         action_dim=2,
         num_steps=1,
-        use_tactile_token=True,
+        use_fm_tactile_token=True,
     )
     model._stream_head_state = None
     model.tactile_adarms = None

@@ -83,7 +83,7 @@ def test_delay_changes_only_condition_token_before_attention():
         observation_delay_max_tokens=4,
         min_period=0.004,
         max_period=4.0,
-        use_tactile_token=False,
+        use_fm_tactile_token=False,
         use_noise_embedding=True,
     )
     model.vlm_with_expert = SimpleNamespace(expert_hidden_size=4)

@@ -143,9 +143,9 @@ def test_runtime_protocol_round_trip_keeps_observation_arrays_and_ack_identity()
 def test_runtime_tactile_modes_validate_config_and_forward_strength_each_step(mode):
     policy = ConformingPolicy(tiny_config())
     runner = runner_for(policy)
-    with pytest.raises(ValueError, match="requires use_tactile_token=True"):
+    with pytest.raises(ValueError, match="requires use_fm_tactile_token=True"):
         RuntimeSession(runner, queue_size=8, inference_mode=mode)
-    policy.config.use_tactile_token = True
+    policy.config.use_fm_tactile_token = True
     with pytest.raises(ValueError, match="requires split streaming inference"):
         RuntimeSession(runner, queue_size=8, inference_mode=mode)
     policy.config.streaming = True

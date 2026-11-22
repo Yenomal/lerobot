@@ -16,14 +16,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 import copy
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-import re
 from typing import Any
 
 import yaml
+
+from .smolvla_compat import migrate_tactile_pipeline_fields
 
 SCHEMA_VERSION = 1
 EXPERIMENT_SOURCE_FILENAME = "experiment.yaml"
@@ -61,7 +63,7 @@ def _load_mapping(path: Path) -> dict[str, Any]:
         raise ExperimentConfigError(f"Invalid experiment YAML {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise ExperimentConfigError(f"Experiment config root must be a mapping: {path}")
-    return value
+    return migrate_tactile_pipeline_fields(value)
 
 
 def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
@@ -114,9 +116,7 @@ def resolve_experiment_config(path: str | Path) -> ResolvedExperimentConfig | No
     resolved = _resolve_file(source_path)
     version = resolved.get("schema_version")
     if isinstance(version, bool) or version != SCHEMA_VERSION:
-        raise ExperimentConfigError(
-            f"Unsupported schema_version {version!r}; expected {SCHEMA_VERSION}."
-        )
+        raise ExperimentConfigError(f"Unsupported schema_version {version!r}; expected {SCHEMA_VERSION}.")
 
     if not EXPERIMENT_FILENAME_PATTERN.fullmatch(source_path.stem):
         raise ExperimentConfigError(

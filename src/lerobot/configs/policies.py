@@ -32,6 +32,7 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.device_utils import auto_select_torch_device, is_amp_available, is_torch_device_available
 from lerobot.utils.hub import HubMixin
 
+from .smolvla_compat import migrate_tactile_cli_args, migrate_tactile_policy_fields
 from .types import FeatureType, PolicyFeature
 
 T = TypeVar("T", bound="PreTrainedConfig")
@@ -231,11 +232,15 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
                 f"Available policy types: {cls.get_known_choices()}"
             ) from e
 
+        if policy_type == "smolvla":
+            config = migrate_tactile_policy_fields(config)
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
             json.dump(config, f)
             config_file = f.name
 
         cli_overrides = policy_kwargs.pop("cli_overrides", [])
+        if policy_type == "smolvla":
+            cli_overrides = migrate_tactile_cli_args(cli_overrides)
         with draccus.config_type("json"):
             config = draccus.parse(config_cls, config_file, args=cli_overrides)
 

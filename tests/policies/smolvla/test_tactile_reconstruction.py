@@ -32,14 +32,14 @@ make_model = test_delay_adarms.make_model
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"use_tactile_token": False},
+        {"use_fm_tactile_token": False},
         {"use_tactile_cfg_gate": True},
         {"use_peft": True},
         {"tactile_reconstruction_hidden_dim": 0},
     ],
 )
 def test_reconstruction_config_validation(overrides):
-    config = {"use_tactile": True, "use_tactile_token": True, "use_tactile_reconstruction": True}
+    config = {"use_tactile": True, "use_fm_tactile_token": True, "use_tactile_reconstruction": True}
     config.update(overrides)
     with pytest.raises(ValueError):
         SmolVLAConfig(**config)

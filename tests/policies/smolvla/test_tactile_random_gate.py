@@ -43,8 +43,8 @@ def test_action_gates_preserve_tactile_masks_and_ca0_context(
             use_tactile_causal_attention=causal,
             fm_tactile_token_history_length=3,
             vlm_tactile_token_history_length=2,
-            vlm_no_tactile_feedback=vlm,
-            fm_tactile_no_vlm_tactile_attention=vlm,
+            vlm_context_reads_tactile=not (vlm),
+            fm_tactile_reads_vlm_tactile=not (vlm),
         )
     )
     for layer in model.vlm_with_expert.lm_expert.layers:

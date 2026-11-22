@@ -202,7 +202,7 @@ def test_streaming_delay_and_tactile_config_validation():
     with pytest.raises(ValueError, match="streaming_attention_mode"):
         SmolVLAConfig(streaming_attention_mode="ramdom_gate")
     with pytest.raises(ValueError, match="requires use_tactile=True"):
-        SmolVLAConfig(use_tactile_token=True)
+        SmolVLAConfig(use_fm_tactile_token=True)
 
 
 def test_observation_delay_selects_history_frame_before_training_forward():
@@ -264,7 +264,7 @@ def test_tactile_features_are_kept_when_enabled():
 def test_tactile_history_aggregates_to_fm_width():
     config = SmolVLAConfig(
         use_tactile=True,
-        use_tactile_token=True,
+        use_fm_tactile_token=True,
         use_tactile_token_history=True,
         tactile_token_history_length=10,
     )
@@ -309,7 +309,7 @@ def test_tactile_token_mask_isolates_t_ca0_and_a0():
 def test_tactile_token_history_uses_causal_tcn_on_fm_width():
     config = SmolVLAConfig(
         use_tactile=True,
-        use_tactile_token=True,
+        use_fm_tactile_token=True,
         use_tactile_token_history=True,
         tactile_token_history_length=3,
         tactile_tcn_width=4,

@@ -153,16 +153,16 @@ def test_history_block_noise_delay_layout_cached_parity_and_gradients(
         assert (markers.grad.abs().flatten(2).sum(-1) > 0).all()
 
 
-@pytest.mark.parametrize("overrides", [{"use_tactile_token": False}, {"use_tactile_token_history": True}])
+@pytest.mark.parametrize("overrides", [{"use_fm_tactile_token": False}, {"use_tactile_token_history": True}])
 def test_causal_config_requires_direct_tactile_tokens(overrides):
-    kwargs = {"use_tactile": True, "use_tactile_token": True, "use_tactile_causal_attention": True}
+    kwargs = {"use_tactile": True, "use_fm_tactile_token": True, "use_tactile_causal_attention": True}
     kwargs.update(overrides)
     with pytest.raises(ValueError, match="use_tactile_causal_attention requires"):
         SmolVLAConfig(**kwargs)
 
 
 def test_causal_config_round_trip(tmp_path):
-    config = SmolVLAConfig(use_tactile=True, use_tactile_token=True, use_tactile_causal_attention=True)
+    config = SmolVLAConfig(use_tactile=True, use_fm_tactile_token=True, use_tactile_causal_attention=True)
     config.save_pretrained(tmp_path)
     assert SmolVLAConfig.from_pretrained(tmp_path).use_tactile_causal_attention
     assert not SmolVLAConfig().use_tactile_causal_attention
@@ -171,7 +171,7 @@ def test_causal_config_round_trip(tmp_path):
 def test_no_vlm_config_validation_and_round_trip(tmp_path):
     with pytest.raises(ValueError, match="tactile_no_vlm_attention requires"):
         SmolVLAConfig(tactile_no_vlm_attention=True)
-    config = SmolVLAConfig(use_tactile=True, use_tactile_token=True, tactile_no_vlm_attention=True)
+    config = SmolVLAConfig(use_tactile=True, use_fm_tactile_token=True, tactile_no_vlm_attention=True)
     config.save_pretrained(tmp_path)
     assert SmolVLAConfig.from_pretrained(tmp_path).tactile_no_vlm_attention
     assert not SmolVLAConfig().tactile_no_vlm_attention

@@ -126,10 +126,12 @@ def _validate_tactile_mode(runner: PolicyRunner, inference_mode: str) -> None:
         "stream-head-mean-tactile-cfg",
     ):
         return
-    if not getattr(runner.policy.config, "use_tactile_token", False):
-        raise ValueError(f"{inference_mode} requires use_tactile_token=True")
+    if not getattr(runner.policy.config, "use_fm_tactile_token", False):
+        raise ValueError(f"{inference_mode} requires use_fm_tactile_token=True")
     if not getattr(runner.policy.config, "use_tactile_ca0", True):
-        raise ValueError(f"{inference_mode} requires use_tactile_ca0=True; use stream or stream-head without CA0")
+        raise ValueError(
+            f"{inference_mode} requires use_tactile_ca0=True; use stream or stream-head without CA0"
+        )
     if not getattr(runner.policy.config, "streaming", False) or not all(
         callable(getattr(runner, method, None)) for method in ("encode_prefix", "predict_from_prefix")
     ):
@@ -185,7 +187,7 @@ class RuntimeSession:
         self.execution_id = 0
         config = runner.policy.config
         lengths = [1]
-        for branch, enabled in (("fm", "use_tactile_token"), ("vlm", "use_vlm_tactile_token")):
+        for branch, enabled in (("fm", "use_fm_tactile_token"), ("vlm", "use_vlm_tactile_token")):
             if getattr(config, enabled, False):
                 value = getattr(config, f"{branch}_tactile_token_history_length", None)
                 lengths.append(
@@ -404,7 +406,7 @@ class RuntimeSession:
         """
         now = time.monotonic()
         config = self.runner.policy.config
-        enabled = getattr(config, "use_tactile_token", False) or getattr(
+        enabled = getattr(config, "use_fm_tactile_token", False) or getattr(
             config, "use_vlm_tactile_token", False
         )
         tactile = {

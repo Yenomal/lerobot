@@ -39,12 +39,12 @@ from lerobot.utils.sample_weighting import SampleWeightingConfig
 from . import parser
 from .default import DatasetConfig, EvalConfig, JobConfig, PeftConfig, TrackioConfig
 from .experiment import (
-    ExperimentConfigMetadata,
     load_experiment_metadata,
     save_experiment_metadata,
 )
 from .policies import PreTrainedConfig
 from .rewards import RewardModelConfig
+from .smolvla_compat import migrate_tactile_cli_args, migrate_tactile_pipeline_fields
 
 TRAIN_CONFIG_NAME = "train_config.json"
 
@@ -503,7 +503,7 @@ class TrainPipelineConfig(HubMixin):
                     filename=f"{latest}/{PRETRAINED_MODEL_DIR}/{TRAIN_CONFIG_NAME}", **dl_kwargs
                 )
 
-        cli_args = kwargs.pop("cli_args", [])
+        cli_args = migrate_tactile_cli_args(kwargs.pop("cli_args", []), prefix="policy.")
         source_config_file = Path(config_file) if config_file is not None else None
 
         if config_file is not None and Path(config_file).suffix.lower() in {".yaml", ".yml"}:
@@ -529,9 +529,13 @@ class TrainPipelineConfig(HubMixin):
             with open(config_file) as f:
                 config = json.load(f)
             migrated = False
-            for migrate in (_migrate_legacy_rabc_fields, _migrate_legacy_wandb_section):
+            for migrate in (
+                _migrate_legacy_rabc_fields,
+                _migrate_legacy_wandb_section,
+                migrate_tactile_pipeline_fields,
+            ):
                 migrated_config = migrate(config)
-                if migrated_config is not None:
+                if migrated_config is not None and migrated_config is not config:
                     config, migrated = migrated_config, True
             if migrated:
                 with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:

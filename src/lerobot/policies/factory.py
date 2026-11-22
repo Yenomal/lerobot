@@ -207,7 +207,7 @@ def make_pre_post_processors(
         if custom_processors is not None:
             return custom_processors
 
-        return load_pretrained_policy_processors(
+        processors = load_pretrained_policy_processors(
             pretrained_path,
             revision=pretrained_revision,
             preprocessor_overrides=kwargs.get("preprocessor_overrides"),
@@ -215,6 +215,11 @@ def make_pre_post_processors(
             preprocessor_config_filename=preprocessor_config_filename,
             postprocessor_config_filename=postprocessor_config_filename,
         )
+        if policy_cfg.type == "smolvla":
+            from .smolvla.processor_smolvla import configure_tactile_delta_preprocessor
+
+            configure_tactile_delta_preprocessor(policy_cfg, processors[0])
+        return processors
 
     # Create new processors from the policy config, resolving the per-policy factory
     # function by naming convention (lazy import keeps optional dependencies optional).

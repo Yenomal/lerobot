@@ -14,7 +14,7 @@ pytestmark = pytest.mark.dataset
 def test_tactile_delta_indices_match_configured_length_in_both_modes(tcn):
     config = SmolVLAConfig(
         use_tactile=True,
-        use_tactile_token=True,
+        use_fm_tactile_token=True,
         use_tactile_token_history=tcn,
         tactile_token_history_length=10,
         n_obs_steps=1,
@@ -47,7 +47,7 @@ def test_separate_history_window_covers_enabled_branches_and_vlm_delay(
 ):
     config = SmolVLAConfig(
         use_tactile=True,
-        use_tactile_token=fm,
+        use_fm_tactile_token=fm,
         use_vlm_tactile_token=vlm,
         fm_tactile_token_history_length=fm_length,
         vlm_tactile_token_history_length=vlm_length,

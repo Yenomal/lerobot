@@ -1,5 +1,6 @@
 """Optional CA0 versus direct first-chunk tactile routing."""
 
+import json
 from dataclasses import replace
 
 import pytest
@@ -156,10 +157,18 @@ def test_layout_conditions_masks_loss_and_cached_parity(
 
 
 def test_ca0_config_default_validation_and_round_trip(tmp_path):
-    assert not SmolVLAConfig().use_tactile_ca0
-    config = SmolVLAConfig(use_tactile=True, use_tactile_token=True, use_tactile_ca0=True)
+    assert SmolVLAConfig().use_tactile_ca0
+    config = SmolVLAConfig(use_tactile=True, use_fm_tactile_token=True, use_tactile_ca0=True)
     config.save_pretrained(tmp_path)
     assert SmolVLAConfig.from_pretrained(tmp_path).use_tactile_ca0
+    # Old checkpoints predate the toggle and must retain their CA0 layout.
+    path = tmp_path / "config.json"
+    saved = json.loads(path.read_text())
+    del saved["use_tactile_ca0"]
+    path.write_text(json.dumps(saved))
+    assert SmolVLAConfig.from_pretrained(tmp_path).use_tactile_ca0
+    replace(config, use_tactile_ca0=False).save_pretrained(tmp_path)
+    assert not SmolVLAConfig.from_pretrained(tmp_path).use_tactile_ca0
     with pytest.raises(ValueError, match="use_tactile_cfg_gate requires use_tactile_ca0"):
         replace(config, use_tactile_ca0=False, use_tactile_cfg_gate=True)
 

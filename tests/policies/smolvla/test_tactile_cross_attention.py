@@ -147,12 +147,12 @@ def test_config_validation_and_round_trip(tmp_path):
     with pytest.raises(ValueError, match="use_tactile_cross_attention requires"):
         SmolVLAConfig(
             use_tactile=True,
-            use_tactile_token=True,
+            use_fm_tactile_token=True,
             use_tactile_cross_attention=True,
             attention_mode="self_attn",
         )
     config = SmolVLAConfig(
-        device="cpu", use_tactile=True, use_tactile_token=True, use_tactile_cross_attention=True
+        device="cpu", use_tactile=True, use_fm_tactile_token=True, use_tactile_cross_attention=True
     )
     config.save_pretrained(tmp_path)
     assert SmolVLAConfig.from_pretrained(tmp_path).use_tactile_cross_attention

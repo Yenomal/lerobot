@@ -92,7 +92,7 @@ def test_only_applied_cfg_strength_is_logged_with_pre_integration_time(
     nn.Module.__init__(model)
     model.config = SimpleNamespace(
         use_tactile_cfg_gate=learned,
-        use_tactile_token=True,
+        use_fm_tactile_token=True,
         chunk_size=2,
         streaming=True,
         streaming_chunk_size=2,
@@ -197,7 +197,7 @@ def test_logged_cosine_covers_directions_and_undefined_zero_fields(
     model = object.__new__(VLAFlowMatching)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(
-        use_tactile_token=True,
+        use_fm_tactile_token=True,
         use_tactile_cfg_gate=False,
         chunk_size=1,
         streaming=False,

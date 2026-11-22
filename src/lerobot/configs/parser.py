@@ -39,6 +39,7 @@ from draccus.wrappers.wrapper import AggregateWrapper, Wrapper
 from lerobot.utils.utils import has_method
 
 from .experiment import ExperimentConfigError, ExperimentConfigMetadata, resolve_experiment_config
+from .smolvla_compat import migrate_tactile_cli_args, migrate_tactile_pipeline_fields
 
 F = TypeVar("F", bound=Callable[..., object])
 
@@ -393,11 +394,7 @@ def extract_path_fields_from_config(config_path: str, path_fields: list[str]) ->
         # The layered experiment schema currently belongs to lerobot-train.
         # Other path-aware CLIs (eval, rollout, env server) keep their ordinary
         # Draccus YAML behavior, including any application-specific `extends`.
-        experiment = (
-            resolve_experiment_config(config_file)
-            if "reward_model" in path_fields
-            else None
-        )
+        experiment = resolve_experiment_config(config_file) if "reward_model" in path_fields else None
         if experiment is not None:
             config_data = experiment.config
             experiment_metadata = experiment.metadata
@@ -416,6 +413,9 @@ def extract_path_fields_from_config(config_path: str, path_fields: list[str]) ->
     # Layered experiments must be materialized into one Draccus-readable file
     # even when there are no special ``*.path`` fields to extract.
     modified = experiment_metadata is not None
+    migrated = migrate_tactile_pipeline_fields(config_data)
+    modified = modified or migrated is not config_data
+    config_data = migrated
     for field in path_fields:
         if field in config_data and isinstance(config_data[field], dict) and PATH_KEY in config_data[field]:
             _config_path_args[field] = str(config_data[field].pop(PATH_KEY))
@@ -459,7 +459,7 @@ def wrap(config_path: Path | None = None) -> Callable[[F], F]:
                 cfg = args[0]
                 args = args[1:]
             else:
-                cli_args = sys.argv[1:]
+                cli_args = migrate_tactile_cli_args(sys.argv[1:], prefix="policy.")
                 plugin_args = parse_plugin_args(PLUGIN_DISCOVERY_SUFFIX, cli_args)
                 for plugin_cli_arg, plugin_path in plugin_args.items():
                     try:

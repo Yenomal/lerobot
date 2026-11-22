@@ -20,6 +20,7 @@ import torch
 
 from lerobot.processor import (
     NewLineTaskProcessorStep,
+    NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
     TokenizerProcessorStep,
@@ -28,6 +29,25 @@ from lerobot.processor import (
 )
 
 from .configuration_smolvla import SmolVLAConfig
+
+
+def configure_tactile_delta_preprocessor(
+    config: SmolVLAConfig, preprocessor: PolicyProcessorPipeline
+) -> None:
+    """Keep marker coordinates raw until model-side subtraction; saved absolute stats do not apply."""
+    if not config.use_tactile_delta:
+        return
+    for step in preprocessor.steps:
+        if isinstance(step, NormalizerProcessorStep):
+            selected = (
+                set(step.features)
+                if step.normalize_observation_keys is None
+                else step.normalize_observation_keys
+            )
+            tactile_keys = set(config.tactile_feature_names)
+            step.normalize_observation_keys = {
+                key for key in selected if "tactile" not in key.lower() and key not in tactile_keys
+            }
 
 
 def make_smolvla_pre_post_processors(
@@ -79,4 +99,6 @@ def make_smolvla_pre_post_processors(
         steps.unnormalize,
         steps.to_cpu,
     ]
-    return make_policy_processor_pipelines(input_steps=input_steps, output_steps=output_steps)
+    processors = make_policy_processor_pipelines(input_steps=input_steps, output_steps=output_steps)
+    configure_tactile_delta_preprocessor(config, processors[0])
+    return processors

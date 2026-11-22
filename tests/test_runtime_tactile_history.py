@@ -24,7 +24,7 @@ def features(value):
 def runner(streaming=False):
     config = SimpleNamespace(
         streaming=streaming,
-        use_tactile_token=True,
+        use_fm_tactile_token=True,
         use_vlm_tactile_token=True,
         fm_tactile_token_history_length=3,
         vlm_tactile_token_history_length=5,
