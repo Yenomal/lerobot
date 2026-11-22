@@ -15,7 +15,7 @@ def test_tactile_delta_indices_match_configured_length_in_both_modes(tcn):
     config = SmolVLAConfig(
         use_tactile=True,
         use_fm_tactile_token=True,
-        use_tactile_token_history=tcn,
+        use_tactile_tcn=tcn,
         tactile_token_history_length=10,
         n_obs_steps=1,
     )

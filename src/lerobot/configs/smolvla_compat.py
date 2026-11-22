@@ -4,6 +4,7 @@ from typing import Any
 
 TACTILE_CONFIG_ALIASES = {
     "use_tactile_token": ("use_fm_tactile_token", False),
+    "use_tactile_token_history": ("use_tactile_tcn", False),
     "vlm_tactile_mask_state": ("vlm_tactile_reads_state", True),
     "state_reads_vlm_tactile": ("vlm_state_reads_tactile", False),
     "vlm_no_tactile_feedback": ("vlm_context_reads_tactile", True),
@@ -16,6 +17,7 @@ def migrate_tactile_policy_fields(config: dict[str, Any]) -> dict[str, Any]:
     if config.get("type", "smolvla") != "smolvla":
         return config
     result = dict(config)
+    result.pop("tactile_tcn_width", None)  # TCN now uses the action expert width throughout.
     for old, (new, invert) in TACTILE_CONFIG_ALIASES.items():
         if old not in result:
             continue

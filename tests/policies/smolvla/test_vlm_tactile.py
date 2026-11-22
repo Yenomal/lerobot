@@ -34,9 +34,9 @@ def test_independent_encoders_prefix_mask_cache_parity_and_gradients(make_model,
             template.config,
             use_vlm_tactile_token=True,
             use_fm_tactile_token=fm,
-            use_tactile_token_history=tcn,
+            use_tactile_tcn=tcn,
             use_tactile_causal_attention=causal,
-            tactile_token_history_length=3,
+            tactile_token_history_length=(5 if tcn else 3),
             tactile_no_vlm_attention=no_vlm,
         )
     )
@@ -129,8 +129,8 @@ def test_lazy_initialization_checkpoint_and_config(make_model, tmp_path):
         template.config,
         use_vlm_tactile_token=True,
         use_fm_tactile_token=False,
-        use_tactile_token_history=True,
-        tactile_token_history_length=3,
+        use_tactile_tcn=True,
+        tactile_token_history_length=5,
     )
     config.input_features = {
         "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(6,)),
@@ -152,7 +152,7 @@ def test_lazy_initialization_checkpoint_and_config(make_model, tmp_path):
     config.save_pretrained(tmp_path)
     loaded = SmolVLAConfig.from_pretrained(tmp_path)
     assert loaded.use_vlm_tactile_token and not loaded.use_fm_tactile_token
-    assert loaded.use_tactile_token_history
+    assert loaded.use_tactile_tcn
     assert "vlm_tactile_projector" in policy._get_default_peft_targets()["target_modules"]
     with pytest.raises(ValueError, match="use_vlm_tactile_token requires"):
         SmolVLAConfig(use_vlm_tactile_token=True)
@@ -228,8 +228,8 @@ def test_vlm_tactile_bf16_autocast_forward_and_backward(make_model, fm, tcn):
             template.config,
             use_vlm_tactile_token=True,
             use_fm_tactile_token=fm,
-            use_tactile_token_history=tcn,
-            tactile_token_history_length=3,
+            use_tactile_tcn=tcn,
+            tactile_token_history_length=(5 if tcn else 3),
         )
     )
     lang = torch.tensor([[1, 2], [3, 4]])
@@ -252,11 +252,13 @@ def test_vlm_tactile_bf16_autocast_forward_and_backward(make_model, fm, tcn):
 @pytest.mark.parametrize("fm_length,vlm_length", [(2, 5), (7, 2)])
 @pytest.mark.parametrize("tcn", [False, True])
 def test_separate_lengths_training_delay_and_cached_parity(make_model, fm_length, vlm_length, tcn):
+    if tcn:
+        fm_length, vlm_length = fm_length * 5, vlm_length * 5
     template = make_model(enabled=False, tactile=True)
     config = replace(
         template.config,
         use_vlm_tactile_token=True,
-        use_tactile_token_history=tcn,
+        use_tactile_tcn=tcn,
         fm_tactile_token_history_length=fm_length,
         vlm_tactile_token_history_length=vlm_length,
     )
@@ -274,12 +276,14 @@ def test_separate_lengths_training_delay_and_cached_parity(make_model, fm_length
     assert vlm_frames[1, :, 0, 0, 0].tolist() == list(range(window - vlm_length, window))
     assert len(config.tactile_observation_delta_indices) == window
     fm_embedding, vlm_embedding = model._encode_tactile(batch), model._encode_tactile(batch, vlm=True)
-    assert model._tactile_token_count(fm_embedding) == (1 if tcn else fm_length)
-    assert (1 if vlm_embedding.ndim == 2 else vlm_embedding.shape[1]) == (1 if tcn else vlm_length)
+    assert model._tactile_token_count(fm_embedding) == (fm_length // 5 if tcn else fm_length)
+    assert (1 if vlm_embedding.ndim == 2 else vlm_embedding.shape[1]) == (
+        vlm_length // 5 if tcn else vlm_length
+    )
     lang, state = torch.tensor([[1, 2], [3, 4]]), torch.randn(2, 6)
     valid = torch.ones_like(lang, dtype=torch.bool)
     cache = model.encode_prefix([], [], lang, valid, state, tactile_batch=batch)
-    assert cache["prefix_pad_masks"].shape[1] == 3 + (1 if tcn else vlm_length)
+    assert cache["prefix_pad_masks"].shape[1] == 3 + (vlm_length // 5 if tcn else vlm_length)
     actions, noise, time = torch.randn(2, 4, 6), torch.randn(2, 4, 6), torch.full((2, 4), 0.5)
     raw, ca0 = model.denoise_step(
         cache["prefix_pad_masks"],

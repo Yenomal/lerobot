@@ -114,13 +114,12 @@ policy:
   tactile_cfg_gate_hidden_dim: 256
   tactile_cfg_lambda_init: 0.5
   tactile_cfg_lambda_max: 2.0
-  use_tactile_token_history: false  # True: TCN-fused token. False: direct history block.
+  use_tactile_tcn: false  # True: one full-width TCN summary per 5 frames. False: direct history.
   use_tactile_causal_attention: false  # Direct history block only: causal instead of bidirectional.
   tactile_no_vlm_attention: false  # Tactile queries read only the tactile block, without VLM prefix K/V.
   tactile_token_history_length: 1  # Legacy fallback when a branch length is null.
   fm_tactile_token_history_length: null  # FM history frames, including the current frame.
   vlm_tactile_token_history_length: null  # VLM history frames at prefix refreshes.
-  tactile_tcn_width: 256
   tactile_feature_names:
     - observation.tactile.left_marker
     - observation.tactile.right_marker

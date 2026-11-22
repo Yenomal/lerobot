@@ -34,12 +34,12 @@ def test_delta_encoder_widths_values_and_training_cached_parity(make_model, tcn)
             make_model(tactile=True, enabled=False).config,
             use_tactile_delta=True,
             use_vlm_tactile_token=True,
-            use_tactile_token_history=tcn,
-            tactile_token_history_length=3,
+            use_tactile_tcn=tcn,
+            tactile_token_history_length=(5 if tcn else 3),
             input_features=marker_features(),
         )
     )
-    batch = {key: torch.randn(2, 3, 2, 63, 2) for key in marker_features()}
+    batch = {key: torch.randn(2, 5 if tcn else 3, 2, 63, 2) for key in marker_features()}
     captured = []
     handle = model.tactile_encoder.register_forward_pre_hook(lambda module, args: captured.append(args[0]))
     model._encode_tactile(batch)
@@ -47,10 +47,10 @@ def test_delta_encoder_widths_values_and_training_cached_parity(make_model, tcn)
     expected = torch.cat(
         [value[:, :, 1].flatten(2) - value[:, :, 0].flatten(2) for value in batch.values()], -1
     )
-    torch.testing.assert_close(captured[0], expected.reshape(6, 252))
+    torch.testing.assert_close(captured[0], expected.reshape(-1, 252))
     model._encode_tactile(batch, vlm=True)
     assert model.tactile_encoder[0].in_features == model.vlm_tactile_encoder[0].in_features == 252
-    shifted = {key: value + torch.randn(2, 3, 1, 63, 2) for key, value in batch.items()}
+    shifted = {key: value + torch.randn(2, 5 if tcn else 3, 1, 63, 2) for key, value in batch.items()}
     torch.testing.assert_close(model._encode_tactile(batch), model._encode_tactile(shifted))
     policy = object.__new__(SmolVLAPolicy)
     nn.Module.__init__(policy)

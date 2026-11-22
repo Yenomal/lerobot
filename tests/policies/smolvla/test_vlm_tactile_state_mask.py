@@ -31,8 +31,8 @@ def test_state_mask_prefix_invariance_and_training_cache_parity(
             vlm_state_reads_tactile=state_reads,
             tactile_no_vlm_attention=no_vlm,
             vlm_context_reads_tactile=not (feedback),
-            use_tactile_token_history=tcn,
-            tactile_token_history_length=3,
+            use_tactile_tcn=tcn,
+            tactile_token_history_length=(5 if tcn else 3),
             prefix_length=12,
         )
     )

@@ -25,6 +25,9 @@ def test_legacy_checkpoint_conversion_and_new_only_save(tmp_path, enabled):
         "use_tactile": True,
         "use_vlm_tactile_token": True,
         "use_tactile_token": True,
+        "use_tactile_token_history": enabled,
+        "fm_tactile_token_history_length": 5,
+        "vlm_tactile_token_history_length": 5,
         "vlm_tactile_mask_state": enabled,
         "state_reads_vlm_tactile": enabled,
         "vlm_no_tactile_feedback": enabled,
@@ -34,6 +37,7 @@ def test_legacy_checkpoint_conversion_and_new_only_save(tmp_path, enabled):
     config = PreTrainedConfig.from_pretrained(tmp_path)
     assert isinstance(config, SmolVLAConfig)
     assert config.use_fm_tactile_token
+    assert config.use_tactile_tcn is enabled
     assert config.vlm_tactile_reads_state is not enabled
     assert config.vlm_state_reads_tactile is enabled
     assert config.vlm_context_reads_tactile is not enabled
@@ -79,6 +83,7 @@ def test_explicit_new_fields_and_cli_override_legacy_checkpoint(tmp_path):
 def test_default_semantics_and_alias_validation():
     config = SmolVLAConfig()
     assert not config.use_fm_tactile_token
+    assert not config.use_tactile_tcn
     assert not config.vlm_tactile_reads_state and not config.vlm_state_reads_tactile
     assert config.vlm_context_reads_tactile and config.fm_tactile_reads_vlm_tactile
     source = {"type": "act", "use_tactile_token": True}
@@ -89,12 +94,14 @@ def test_default_semantics_and_alias_validation():
         [
             "--policy.use_tactile_token",
             "true",
+            "--policy.use_tactile_token_history=true",
             "--policy.vlm_no_tactile_feedback=false",
             "--steps=5",
         ],
         prefix="policy.",
     ) == [
         "--policy.use_fm_tactile_token=true",
+        "--policy.use_tactile_tcn=true",
         "--policy.vlm_context_reads_tactile=true",
         "--steps=5",
     ]

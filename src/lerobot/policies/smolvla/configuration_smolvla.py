@@ -104,8 +104,8 @@ class SmolVLAConfig(PreTrainedConfig):
     tactile_cfg_gate_hidden_dim: int = 256
     tactile_cfg_lambda_init: float = 0.5
     tactile_cfg_lambda_max: float = 2.0
-    # True: fuse history with TCN. False: keep each frame as an FM token.
-    use_tactile_token_history: bool = False
+    # True: emit one causal TCN summary per five frames. False: keep each frame.
+    use_tactile_tcn: bool = False
     # Direct history tokens read only themselves and older tactile frames.
     use_tactile_causal_attention: bool = False
     # Tactile queries attend only to tactile tokens, without reading VLM prefix K/V.
@@ -114,9 +114,6 @@ class SmolVLAConfig(PreTrainedConfig):
     # Per-branch lengths; None preserves the legacy shared value above.
     fm_tactile_token_history_length: int | None = None
     vlm_tactile_token_history_length: int | None = None
-    # Width of the causal tactile history encoder. The resulting token is
-    # projected into the FM/action-expert stream and is refreshed per inference.
-    tactile_tcn_width: int = 256
     tactile_feature_names: tuple[str, ...] = (
         "observation.tactile.left_marker",
         "observation.tactile.right_marker",
@@ -306,18 +303,18 @@ class SmolVLAConfig(PreTrainedConfig):
         if self.use_tactile_cfg_gate and self.use_peft:
             raise ValueError("use_tactile_cfg_gate trains only the gate and does not support PEFT")
         has_tactile_tokens = self.use_fm_tactile_token or self.use_vlm_tactile_token
-        if self.use_tactile_token_history and not has_tactile_tokens:
+        if self.use_tactile_tcn and not has_tactile_tokens:
             raise ValueError(
-                "use_tactile_token_history requires use_fm_tactile_token=True or use_vlm_tactile_token=True"
+                "use_tactile_tcn requires use_fm_tactile_token=True or use_vlm_tactile_token=True"
             )
         if self.tactile_no_vlm_attention and not has_tactile_tokens:
             raise ValueError(
                 "tactile_no_vlm_attention requires use_fm_tactile_token=True or use_vlm_tactile_token=True"
             )
-        if self.use_tactile_causal_attention and (not has_tactile_tokens or self.use_tactile_token_history):
+        if self.use_tactile_causal_attention and (not has_tactile_tokens or self.use_tactile_tcn):
             raise ValueError(
                 "use_tactile_causal_attention requires use_fm_tactile_token=True or use_vlm_tactile_token=True, "
-                "and use_tactile_token_history=False"
+                "and use_tactile_tcn=False"
             )
         if self.tactile_token_history_length <= 0:
             raise ValueError("tactile_token_history_length must be positive")
@@ -325,8 +322,11 @@ class SmolVLAConfig(PreTrainedConfig):
             value = getattr(self, name)
             if value is not None and value <= 0:
                 raise ValueError(f"{name} must be positive")
-        if self.tactile_tcn_width <= 0:
-            raise ValueError("tactile_tcn_width must be positive")
+        if self.use_tactile_tcn:
+            for vlm, enabled in ((False, self.use_fm_tactile_token), (True, self.use_vlm_tactile_token)):
+                if enabled and self.get_tactile_history_length(vlm=vlm) % 5:
+                    branch = "VLM" if vlm else "FM"
+                    raise ValueError(f"TCN {branch} tactile history length must be a multiple of 5")
         if not math.isfinite(self.streaming_constant_weight) or not math.isfinite(
             self.streaming_chunk_wise_weight
         ):

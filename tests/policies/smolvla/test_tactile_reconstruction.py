@@ -54,8 +54,8 @@ def test_reconstruction_target_gradients_reduction_and_checkpoint(make_model, tm
             template.config,
             use_tactile_reconstruction=True,
             tactile_reconstruction_hidden_dim=16,
-            use_tactile_token_history=history,
-            tactile_token_history_length=3,
+            use_tactile_tcn=history,
+            tactile_token_history_length=(5 if history else 3),
             input_features={
                 OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(6,)),
                 **{
@@ -85,9 +85,7 @@ def test_reconstruction_target_gradients_reduction_and_checkpoint(make_model, tm
     }
     for side in ("left", "right"):
         key = f"observation.tactile.{side}_marker"
-        batch[key] = torch.cat(
-            [torch.randn_like(batch[key]), torch.randn_like(batch[key]), batch[key]], dim=1
-        )
+        batch[key] = torch.cat([torch.randn_like(batch[key])] * (4 if history else 2) + [batch[key]], dim=1)
     target = torch.cat(
         [batch[f"observation.tactile.{side}_marker"][:, -1].flatten(1) for side in ("left", "right")], dim=-1
     )

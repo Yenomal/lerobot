@@ -285,8 +285,8 @@ def test_random_tactile_changes_ca0_but_preserves_raw_fields_and_action_rng(gate
     policy = object.__new__(SmolVLAPolicy)
     nn.Module.__init__(policy)
     policy.config = model.config
-    policy.config.use_tactile_token_history = True
-    policy.config.tactile_token_history_length = 3
+    policy.config.use_tactile_tcn = True
+    policy.config.tactile_token_history_length = 5
     policy.model = model
     policy.reset()
     policy.eval()

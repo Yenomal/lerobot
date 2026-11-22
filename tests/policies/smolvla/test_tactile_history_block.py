@@ -18,7 +18,9 @@ make_model = test_delay_adarms.make_model
 def test_encoder_width_history_order_bootstrap_and_runtime_reset(make_model, tcn):
     template = make_model(tactile=True, expert_width_multiplier=0.5)
     model = VLAFlowMatching(
-        replace(template.config, use_tactile_token_history=tcn, tactile_token_history_length=3)
+        replace(
+            template.config, use_tactile_tcn=tcn, tactile_token_history_length=(5 if tcn else 3)
+        )
     )
     policy = object.__new__(SmolVLAPolicy)
     nn.Module.__init__(policy)
@@ -38,7 +40,9 @@ def test_encoder_width_history_order_bootstrap_and_runtime_reset(make_model, tcn
         inputs.append(current)
         prepared = policy._prepare_batch(dict(current))
         left = prepared["observation.tactile.left_marker_history"]
-        assert left[0, :, 0, 0, 0].tolist() == [float(max(0, step - lag)) for lag in (2, 1, 0)]
+        assert left[0, :, 0, 0, 0].tolist() == [
+            float(max(0, step - lag)) for lag in reversed(range(5 if tcn else 3))
+        ]
         actual = model._encode_tactile(prepared)
         # Training gets the same frames stacked on the observation axis.
         training = {
@@ -46,7 +50,7 @@ def test_encoder_width_history_order_bootstrap_and_runtime_reset(make_model, tcn
             for side in ("left", "right")
         }
         torch.testing.assert_close(actual, model._encode_tactile(training))
-        assert actual.shape == ((2, 4) if tcn else (2, 3, 4))
+        assert actual.shape == ((2, 1, 4) if tcn else (2, 3, 4))
         if not tcn:
             frames = model._encode_tactile_frames(training)
             torch.testing.assert_close(actual, frames)
@@ -55,7 +59,9 @@ def test_encoder_width_history_order_bootstrap_and_runtime_reset(make_model, tcn
     policy.reset()
     assert not policy._tactile_history
     prepared = policy._prepare_batch(dict(inputs[-1]))
-    assert prepared["observation.tactile.left_marker_history"][0, :, 0, 0, 0].tolist() == [3.0] * 3
+    assert prepared["observation.tactile.left_marker_history"][0, :, 0, 0, 0].tolist() == [3.0] * (
+        5 if tcn else 3
+    )
 
 
 @pytest.mark.parametrize("attention_mode", ["self_attn", "cross_attn"])
@@ -77,8 +83,8 @@ def test_history_block_noise_delay_layout_cached_parity_and_gradients(
     model = VLAFlowMatching(
         replace(
             template.config,
-            use_tactile_token_history=tcn,
-            tactile_token_history_length=3,
+            use_tactile_tcn=tcn,
+            tactile_token_history_length=(5 if tcn else 3),
             use_tactile_causal_attention=causal,
             tactile_no_vlm_attention=no_vlm,
         )
@@ -137,7 +143,7 @@ def test_history_block_noise_delay_layout_cached_parity_and_gradients(
     loss = model([], [], lang, lang_mask, state, actions, noise, time, tactile_batch=batch, **delay)
     # Cached and joint training paths give CA0/A0 the same position and A_i consecutive positions.
     torch.testing.assert_close(positions[0], positions[1][:, -suffix.shape[1] :])
-    first_action = cache["prefix_pad_masks"].sum(-1) + 4 + count
+    first_action = cache["prefix_pad_masks"].sum(-1) + 4 + (5 if tcn else count)
     expected_positions = first_action[:, None] + torch.arange(4)[None]
     torch.testing.assert_close(positions[0][:, -4:], expected_positions)
     torch.testing.assert_close(positions[0][:, -5], positions[0][:, -4])
@@ -153,7 +159,7 @@ def test_history_block_noise_delay_layout_cached_parity_and_gradients(
         assert (markers.grad.abs().flatten(2).sum(-1) > 0).all()
 
 
-@pytest.mark.parametrize("overrides", [{"use_fm_tactile_token": False}, {"use_tactile_token_history": True}])
+@pytest.mark.parametrize("overrides", [{"use_fm_tactile_token": False}, {"use_tactile_tcn": True}])
 def test_causal_config_requires_direct_tactile_tokens(overrides):
     kwargs = {"use_tactile": True, "use_fm_tactile_token": True, "use_tactile_causal_attention": True}
     kwargs.update(overrides)
@@ -252,8 +258,8 @@ def test_tactile_hidden_independent_of_prefix_when_disabled(
     model = VLAFlowMatching(
         replace(
             template.config,
-            use_tactile_token_history=tcn,
-            tactile_token_history_length=3,
+            use_tactile_tcn=tcn,
+            tactile_token_history_length=(5 if tcn else 3),
             use_tactile_causal_attention=causal,
             tactile_no_vlm_attention=no_vlm,
         )

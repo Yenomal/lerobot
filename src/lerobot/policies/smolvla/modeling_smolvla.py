@@ -1126,18 +1126,13 @@ class VLAFlowMatching(nn.Module):
             self.tactile_finger_embedding = (
                 nn.Embedding(2, tactile_hidden) if self.config.use_tactile_finger_tokens else None
             )
-            if self.config.use_tactile_token_history:
-                self.tactile_tcn_width = self.config.tactile_tcn_width
-                self.tactile_token_tcn_in = nn.Linear(
-                    self.vlm_with_expert.expert_hidden_size, self.tactile_tcn_width
-                )
-                self.tactile_token_tcn_1 = nn.Linear(3 * self.tactile_tcn_width, self.tactile_tcn_width)
-                self.tactile_token_tcn_2 = nn.Linear(3 * self.tactile_tcn_width, self.tactile_tcn_width)
-                self.tactile_token_out = nn.Linear(
-                    self.tactile_tcn_width, self.vlm_with_expert.expert_hidden_size
-                )
+            if self.config.use_tactile_tcn:
+                width = self.vlm_with_expert.expert_hidden_size
+                self.tactile_token_tcn_in = nn.Linear(width, width)
+                self.tactile_token_tcn_1 = nn.Linear(3 * width, width)
+                self.tactile_token_tcn_2 = nn.Linear(3 * width, width)
+                self.tactile_token_out = nn.Linear(width, width)
             else:
-                self.tactile_tcn_width = None
                 self.tactile_token_tcn_in = None
                 self.tactile_token_tcn_1 = None
                 self.tactile_token_tcn_2 = None
@@ -1166,8 +1161,8 @@ class VLAFlowMatching(nn.Module):
                 nn.Embedding(2, width) if self.config.use_tactile_finger_tokens else None
             )
             self.vlm_tactile_projector = nn.Linear(width, self.vlm_with_expert.config.text_config.hidden_size)
-            if self.config.use_tactile_token_history:
-                tcn_width = self.config.tactile_tcn_width
+            if self.config.use_tactile_tcn:
+                tcn_width = width
                 self.vlm_tactile_token_tcn_in = nn.Linear(width, tcn_width)
                 self.vlm_tactile_token_tcn_1 = nn.Linear(3 * tcn_width, tcn_width)
                 self.vlm_tactile_token_tcn_2 = nn.Linear(3 * tcn_width, tcn_width)
@@ -1390,7 +1385,7 @@ class VLAFlowMatching(nn.Module):
                 history_key = f"{key}_vlm_history"
             use_history = (
                 self.config.use_fm_tactile_token
-                or self.config.use_tactile_token_history
+                or self.config.use_tactile_tcn
                 or getattr(self.config, "use_vlm_tactile_token", False)
             )
             if use_history and history_key is not None:
@@ -1497,17 +1492,15 @@ class VLAFlowMatching(nn.Module):
             # Each finger is a separate batch item for temporal convolution.
             frames = frames.permute(0, 2, 1, 3).reshape(batch_size * 2, history, width)
         tcn_in = getattr(self, f"{prefix}tactile_token_tcn_in", None)
-        if self.config.use_tactile_token_history and tcn_in is not None:
+        if self.config.use_tactile_tcn and tcn_in is not None:
             x = F.gelu(tcn_in(frames))
             x = F.gelu(
                 x + getattr(self, f"{prefix}tactile_token_tcn_1")(self._causal_conv_inputs(x, dilation=1))
             )
             x = F.gelu(
-                x + getattr(self, f"{prefix}tactile_token_tcn_2")(self._causal_conv_inputs(x, dilation=2))
+                x + getattr(self, f"{prefix}tactile_token_tcn_2")(self._causal_conv_inputs(x, dilation=1))
             )
-            frames = getattr(self, f"{prefix}tactile_token_out")(x[:, -1:, :])
-            if not split:
-                return frames[:, 0]
+            frames = getattr(self, f"{prefix}tactile_token_out")(x[:, 4::5, :])
         if split:
             frames = frames.reshape(batch_size, 2, -1, width).permute(0, 2, 1, 3)
             embedding = getattr(self, f"{prefix}tactile_finger_embedding")
@@ -1527,20 +1520,22 @@ class VLAFlowMatching(nn.Module):
         """VLM tactile is the final valid prefix block, before optional padding."""
         if not getattr(self.config, "use_vlm_tactile_token", False):
             return torch.zeros_like(pad_masks)
-        count = (
-            1 if self.config.use_tactile_token_history else self.config.get_tactile_history_length(vlm=True)
-        )
+        count = self.config.get_tactile_history_length(vlm=True)
+        if self.config.use_tactile_tcn:
+            count //= 5
         if getattr(self.config, "use_tactile_finger_tokens", False):
             count *= 2
         positions = torch.arange(pad_masks.shape[1], device=pad_masks.device)[None, :]
         end = torch.where(pad_masks, positions + 1, 0).amax(-1, keepdim=True)
         return pad_masks & (positions >= end - count) & (positions < end)
 
-    def _finger_position_ids(self, positions: Tensor, tactile_mask: Tensor) -> Tensor:
-        """Finger pairs share a time position; later tokens remain consecutive."""
-        if getattr(self.config, "use_tactile_finger_tokens", False):
-            positions = positions - tactile_mask.long().cumsum(-1) // 2
-        return positions
+    def _tactile_position_ids(self, positions: Tensor, tactile_mask: Tensor) -> Tensor:
+        """Preserve summary endpoints 4,9,... and give finger pairs the same time."""
+        fingers = 2 if getattr(self.config, "use_tactile_finger_tokens", False) else 1
+        stride = 5 if getattr(self.config, "use_tactile_tcn", False) else 1
+        ordinal = tactile_mask.long().cumsum(-1) - 1
+        extra = torch.where(ordinal % fingers == 0, stride - 1, -1)
+        return positions + (extra * tactile_mask).cumsum(-1)
 
     def _encode_tactile_adarms(self, batch: dict[str, Tensor]) -> Tensor | None:
         """Project the current frame for per-layer tactile AdaLN-Zero conditioning."""
@@ -2311,7 +2306,7 @@ class VLAFlowMatching(nn.Module):
         if tactile_count:
             tactile_start = prefix_pad_masks.shape[1] + delay_token_count
             position_tactile_mask[:, tactile_start : tactile_start + tactile_count] = True
-        position_ids = self._finger_position_ids(position_ids, position_tactile_mask)
+        position_ids = self._tactile_position_ids(position_ids, position_tactile_mask)
         if tactile_embedding is not None and self.config.use_fm_tactile_token and self._use_tactile_ca0():
             action0_index = prefix_pad_masks.shape[1] + tactile_count + 1
             if self.observation_delay_token_embedding is not None:
@@ -2403,7 +2398,7 @@ class VLAFlowMatching(nn.Module):
         prefix_att_2d_masks = self._apply_vlm_tactile_prefix_mask(
             prefix_att_2d_masks, prefix_pad_masks, prefix_att_masks
         )
-        prefix_position_ids = self._finger_position_ids(
+        prefix_position_ids = self._tactile_position_ids(
             torch.cumsum(prefix_pad_masks, dim=1) - 1, prefix_att_masks == 2
         )
         _, past_key_values = self.vlm_with_expert.forward(
@@ -3023,15 +3018,15 @@ class VLAFlowMatching(nn.Module):
                 prefix_tactile_mask=self._prefix_tactile_keys(prefix_pad_masks),
             )
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        if getattr(self.config, "use_tactile_finger_tokens", False):
-            prefix_offsets = (
-                prefix_offsets - self._prefix_tactile_keys(prefix_pad_masks).sum(-1, keepdim=True) // 2
-            )
+        prefix_tactile_count = self._prefix_tactile_keys(prefix_pad_masks).sum(-1, keepdim=True)
+        fingers = 2 if getattr(self.config, "use_tactile_finger_tokens", False) else 1
+        stride = 5 if getattr(self.config, "use_tactile_tcn", False) else 1
+        prefix_offsets = prefix_offsets + prefix_tactile_count // fingers * stride - prefix_tactile_count
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
         position_tactile_mask = torch.zeros_like(suffix_pad_masks)
         if tactile_count:
             position_tactile_mask[:, delay_token_count : delay_token_count + tactile_count] = True
-        position_ids = self._finger_position_ids(position_ids, position_tactile_mask)
+        position_ids = self._tactile_position_ids(position_ids, position_tactile_mask)
         if tactile_embedding is not None and self.config.use_fm_tactile_token and self._use_tactile_ca0():
             action0_index = tactile_count + 1
             if self.observation_delay_token_embedding is not None:

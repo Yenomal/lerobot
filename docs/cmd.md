@@ -277,13 +277,12 @@ policy:
   tactile_cfg_gate_hidden_dim: 256
   tactile_cfg_lambda_init: 0.5
   tactile_cfg_lambda_max: 2.0
-  use_tactile_token_history: false  # True: TCN-fused token. False: direct history block.
+  use_tactile_tcn: false  # True: TCN summaries every 5 frames. False: direct history block.
   use_tactile_causal_attention: false  # Causal history attention requires TCN disabled.
   tactile_no_vlm_attention: false  # Tactile queries do not read VLM prefix K/V when true.
   tactile_token_history_length: 1  # Legacy fallback when a branch length is null.
   fm_tactile_token_history_length: null  # FM history length, including the current frame.
   vlm_tactile_token_history_length: null  # VLM history length at prefix refreshes.
-  tactile_tcn_width: 256
 ```
 
 数量偏置实验：设置 `policy.use_modality_count_bias: true`（默认 `false`）。仅对 FM query，
@@ -481,9 +480,16 @@ attention 间接获得 FM 触觉。现有 action–action mask 保持不变。
 `fm_tactile_token_history_length` 和 `vlm_tactile_token_history_length` 分别指定两侧包含当前帧的历史长度。
 两者默认 `null`，各自回退到旧配置 `tactile_token_history_length`（默认 1），兼容已有实验与 checkpoint。
 显式设置任意一侧的新字段只覆盖该侧，另一侧保持自己的配置或兼容回退值。
-`use_tactile_token_history=true` 时，每帧先独立经过 MLP，再经过两层因果空洞 TCN
-（dilation 1、2），最后一帧输出作为单个 tactile token（未拆指时 `H=1`，拆指时每指一个）。
-`use_tactile_token_history=false` 时跳过 TCN，每帧 MLP 输出按从旧到新的顺序直接组成触觉 block，
+`use_tactile_tcn=true` 时，每帧先独立经过 MLP，再经过两层因果 TCN
+（kernel=3、dilation=1、1，感受野5帧），取输出位置 `4,9,14,19,...`，每5帧生成一个局部摘要。
+TCN 输入、隐藏层和输出宽度统一为 FM expert hidden size（默认720），不再提供 `tactile_tcn_width`。
+不额外池化，不新增配置参数。已启用分支的历史长度必须是5的倍数：5→1、10→2、20→4个摘要。
+摘要保留末帧的 RoPE 时间位置（相对于触觉 block 起点为4、9、14、19），后续 action 位置仍连续。
+VLM/FM 按各自配置的历史长度独立压缩；拆指时左右指放在 batch 维，共享同分支的 TCN，
+每个摘要时段得到左右两个 token。例如 VLM 20帧→8个、FM 5帧→2个，时间顺序仍从旧到新。
+旧256维/最终单token TCN 的权重不兼容新结构及语义，需要重新训练；旧字段在配置加载时移除，
+不代表旧 TCN 权重可自动迁移。未开启 TCN 的权重行为不变。
+`use_tactile_tcn=false` 时跳过 TCN，每帧 MLP 输出按从旧到新的顺序直接组成触觉 block，
 此时各侧 `H` 等于自己的历史长度。训练读取足以覆盖两侧历史及 VLM delay 的窗口，再独立截取；Runtime 按 session
 维护可容纳两侧所需长度的共享池，启动时不足的历史用第一帧补齐，reset 后清空。
 所有触觉 token 使用 clean noise time；CA0 保持与 A0 相同的 noise/delay 条件和 RoPE 位置。
@@ -497,7 +503,7 @@ action RoPE 从 A0 开始连续递增，CA0 复用 A0 位置，不额外占用�
 policy:
   use_tactile: true
   use_fm_tactile_token: true
-  use_tactile_token_history: false
+  use_tactile_tcn: false
   fm_tactile_token_history_length: 10
   use_tactile_causal_attention: true
 ```
@@ -547,8 +553,9 @@ finger ID 表完全独立。各侧使用 `nn.Embedding(2, expert_hidden_size)`�
 将查表得到的向量加到该指 MLP/TCN 输出；VLM 侧随后再通过 VLM projector。
 
 历史长度仍按帧计数。关闭 TCN 时，各侧 `H` 帧生成 `2H` 个 token，排列为
-`L_old,R_old,...,L_current,R_current`；开启 TCN 时，分别融合左右指历史，得到 `L_current,R_current`
-两个 token。同帧左右指共享一个 RoPE 时间位置，finger embedding 区分左右；后续 action 的位置仍连续。
+`L_old,R_old,...,L_current,R_current`；开启 TCN 时，分别融合左右指历史，每5帧生成一组左右摘要，
+例如20帧排列为 `L4,R4,L9,R9,L14,R14,L19,R19`。同帧左右指共享一个 RoPE 时间位置，
+finger embedding 区分左右；后续 action 的位置仍连续。
 触觉内部因果 mask 按帧执行：同一帧两指可互相读取，不能读取未来帧；双向模式整个触觉 block 互通。
 cross-attention、模态数量 bias、CA0/首 chunk 路由和 VLM 触觉隔离均按实际 token 数生效。
 CFG gate 读取最新左右两个 FM hidden 的均值；重建 probe 共用 decoder，分别重建当前左右指后合并 MSE；
@@ -562,7 +569,7 @@ policy:
   use_tactile: true
   use_vlm_tactile_token: true
   use_fm_tactile_token: false  # FM 分支开关；设为 true 可同时启用两套独立编码器。
-  use_tactile_token_history: false
+  use_tactile_tcn: false
   vlm_tactile_token_history_length: 7
   fm_tactile_token_history_length: 3
 ```
@@ -625,12 +632,17 @@ VLM 触觉仍可读取图像/语言及自身 block；是否读取 state 由 `vlm
 `vlm_no_tactile_feedback → vlm_context_reads_tactile`、
 `fm_tactile_no_vlm_tactile_attention → fm_tactile_reads_vlm_tactile` 取值取反。
 旧字段不再写入新 checkpoint；同一层配置同时包含新旧名时，新名优先，分层 YAML 仍由后代配置覆盖父配置。
-旧 CLI 布尔参数同样转换，建议新实验直接使用新名。`use_tactile_token_history` 等其他配置名不变。
+旧 CLI 布尔参数同样转换，建议新实验直接使用新名。
+TCN 开关也统一改为 `use_tactile_tcn`，旧名 `use_tactile_token_history` 按原值转换；
+关闭 TCN 仍保留历史帧，只跳过时间压缩。
 
-两分支独立控制历史长度，共享 TCN 开关与宽度、触觉内部因果开关和 `tactile_no_vlm_attention`，
+两分支独立控制历史长度，共享 TCN 开关、触觉内部因果开关和 `tactile_no_vlm_attention`，
 但 MLP/TCN 的参数完全独立。默认均为 `504 → 720 → 720`；TCN 输出也为 720 维，
 VLM 侧额外经过 `vlm_tactile_projector: 720 → VLM hidden size`（默认 960）。
-未拆指时，关闭 TCN 两边各有对应历史长度的 token，开启时各融合为一个；拆指模式数量加倍。
+TCN 的 `tactile_token_out`（VLM 侧为 `vlm_tactile_token_out`）保留为 `720 → 720` 的
+可学习线性投影，用于重新组合融合后的特征通道；token 数量由每5帧取一个 TCN 输出控制，
+并非由这个投影层压缩。
+未拆指时，关闭 TCN 两边各有对应历史长度的 token，开启时数量为各自历史长度除以5；拆指模式数量加倍。
 VLM 侧无 FM noise/delay AdaLN，
 使用普通 VLM RMSNorm；其 RoPE 位置在 state 后连续递增。
 

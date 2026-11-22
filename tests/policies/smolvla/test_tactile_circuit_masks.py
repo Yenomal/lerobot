@@ -34,9 +34,9 @@ def test_flags_masks_cache_parity_and_hidden_invariance(
             use_tactile_ca0=False,
             vlm_context_reads_tactile=not (no_feedback),
             fm_tactile_reads_vlm_tactile=not (no_fm_read),
-            use_tactile_token_history=tcn,
-            fm_tactile_token_history_length=3,
-            vlm_tactile_token_history_length=2,
+            use_tactile_tcn=tcn,
+            fm_tactile_token_history_length=(5 if tcn else 3),
+            vlm_tactile_token_history_length=(5 if tcn else 2),
             prefix_length=12,
         )
     )

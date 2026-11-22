@@ -213,7 +213,7 @@ def test_observation_delay_selects_history_frame_before_training_forward():
         streaming_chunk_size=5,
         image_features={"observation.images.camera": object()},
         use_tactile=False,
-        use_tactile_token_history=False,
+        use_tactile_tcn=False,
     )
     policy = object.__new__(SmolVLAPolicy)
     torch.nn.Module.__init__(policy)
@@ -265,24 +265,24 @@ def test_tactile_history_aggregates_to_fm_width():
     config = SmolVLAConfig(
         use_tactile=True,
         use_fm_tactile_token=True,
-        use_tactile_token_history=True,
+        use_tactile_tcn=True,
         tactile_token_history_length=10,
     )
     model = object.__new__(VLAFlowMatching)
     torch.nn.Module.__init__(model)
     model.config = config
     model.tactile_encoder = torch.nn.Sequential(torch.nn.Linear(504, 8))
-    model.tactile_token_tcn_in = torch.nn.Linear(8, 4)
-    model.tactile_token_tcn_1 = torch.nn.Linear(12, 4)
-    model.tactile_token_tcn_2 = torch.nn.Linear(12, 4)
-    model.tactile_token_out = torch.nn.Linear(4, 8)
+    model.tactile_token_tcn_in = torch.nn.Linear(8, 8)
+    model.tactile_token_tcn_1 = torch.nn.Linear(24, 8)
+    model.tactile_token_tcn_2 = torch.nn.Linear(24, 8)
+    model.tactile_token_out = torch.nn.Linear(8, 8)
     batch = {
         "observation.tactile.left_marker_history": torch.randn(1, 10, 2, 63, 2),
         "observation.tactile.right_marker_history": torch.randn(1, 10, 2, 63, 2),
         "observation.tactile.left_marker": torch.randn(1, 2, 63, 2),
         "observation.tactile.right_marker": torch.randn(1, 2, 63, 2),
     }
-    assert model._encode_tactile(batch).shape == (1, 8)
+    assert model._encode_tactile(batch).shape == (1, 2, 8)
 
 
 def test_tactile_token_mask_isolates_t_ca0_and_a0():
@@ -310,24 +310,23 @@ def test_tactile_token_history_uses_causal_tcn_on_fm_width():
     config = SmolVLAConfig(
         use_tactile=True,
         use_fm_tactile_token=True,
-        use_tactile_token_history=True,
-        tactile_token_history_length=3,
-        tactile_tcn_width=4,
+        use_tactile_tcn=True,
+        tactile_token_history_length=5,
     )
     model = object.__new__(VLAFlowMatching)
     torch.nn.Module.__init__(model)
     model.config = config
     model.tactile_encoder = torch.nn.Sequential(torch.nn.Linear(504, 6))
-    model.tactile_token_tcn_in = torch.nn.Linear(6, 4)
-    model.tactile_token_tcn_1 = torch.nn.Linear(12, 4)
-    model.tactile_token_tcn_2 = torch.nn.Linear(12, 4)
-    model.tactile_token_out = torch.nn.Linear(4, 6)
+    model.tactile_token_tcn_in = torch.nn.Linear(6, 6)
+    model.tactile_token_tcn_1 = torch.nn.Linear(18, 6)
+    model.tactile_token_tcn_2 = torch.nn.Linear(18, 6)
+    model.tactile_token_out = torch.nn.Linear(6, 6)
     batch = {
-        "observation.tactile.left_marker_history": torch.randn(1, 3, 2, 63, 2),
-        "observation.tactile.right_marker_history": torch.randn(1, 3, 2, 63, 2),
+        "observation.tactile.left_marker_history": torch.randn(1, 5, 2, 63, 2),
+        "observation.tactile.right_marker_history": torch.randn(1, 5, 2, 63, 2),
     }
     token = model._encode_tactile(batch)
-    assert token.shape == (1, 6)
+    assert token.shape == (1, 1, 6)
 
 
 def test_stream_head_history_follows_action_token_through_window():

@@ -77,9 +77,9 @@ def test_layout_conditions_masks_loss_and_cached_parity(
             template.config,
             use_tactile_ca0=ca0,
             use_vlm_tactile_token=vlm,
-            fm_tactile_token_history_length=3,
-            vlm_tactile_token_history_length=2,
-            use_tactile_token_history=tcn,
+            fm_tactile_token_history_length=(5 if tcn else 3),
+            vlm_tactile_token_history_length=(5 if tcn else 2),
+            use_tactile_tcn=tcn,
             prefix_length=12,
         )
     )
