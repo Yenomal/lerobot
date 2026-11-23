@@ -14,6 +14,7 @@
 
 import math
 from dataclasses import dataclass, field
+from typing import Any
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
@@ -78,6 +79,10 @@ class SmolVLAConfig(PreTrainedConfig):
     use_tactile_finger_tokens: bool = False
     # Legacy option name: per-layer RMSNorm scale/shift and zero residual gates.
     use_tactile_adarms: bool = False
+    # Use the discrete PCA/HMM state as the tactile AdaLN-Zero condition.
+    use_tactile_hmm: bool = False
+    # Populated from dataset meta/hmm.json and saved with the policy for inference.
+    tactile_hmm_metadata: dict[str, Any] | None = field(default=None, repr=False)
     use_fm_tactile_token: bool = False
     # True: isolated CA0 branch. False: first execution chunk reads live FM tactile.
     use_tactile_ca0: bool = True
@@ -259,6 +264,8 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError("observation_delay_zero_bypass requires delay AdaLN-Zero without noise AdaRMS")
         if self.use_tactile_adarms and not self.use_tactile:
             raise ValueError("use_tactile_adarms requires use_tactile=True")
+        if self.use_tactile_hmm and not self.use_tactile_adarms:
+            raise ValueError("use_tactile_hmm requires use_tactile_adarms=True")
         if self.use_tactile_delta and not self.use_tactile:
             raise ValueError("use_tactile_delta requires use_tactile=True")
         if self.use_tactile_finger_tokens and not self.use_tactile:

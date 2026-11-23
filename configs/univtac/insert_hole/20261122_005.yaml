@@ -1,0 +1,22 @@
+schema_version: 1
+extends: base.yaml
+
+exp_name: "20261122_005"
+scripts: "FM tactile token: tcn compress tactile time"
+
+policy:
+  streaming: true
+  streaming_attention_mode: random_gate
+  n_obs_steps: 21
+  observation_delay_max_tokens: 20
+  use_observation_delay_adaln_zero: true
+  use_tactile: true
+  use_fm_tactile_token: true
+  use_tactile_delta: true
+  fm_tactile_token_history_length: 20
+  use_modality_count_bias: true
+  use_tactile_ca0: true
+  use_tactile_finger_tokens: true
+  use_tactile_self_attention: false
+  use_tactile_cross_attention: true
+  use_tactile_tcn: true

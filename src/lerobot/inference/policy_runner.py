@@ -247,6 +247,10 @@ class PolicyRunner:
                 batch[name] = torch.from_numpy(history.copy()).unsqueeze(0)
         batch["task"] = [observation.task]
         batch["robot_type"] = self.robot_type
+        if observation.tactile_hmm_state is not None:
+            from lerobot.policies.smolvla.tactile_hmm import TACTILE_HMM_STATE
+
+            batch[TACTILE_HMM_STATE] = torch.tensor([observation.tactile_hmm_state], dtype=torch.long)
         return batch
 
     def _prepare_observation(self, observation: ObservationSnapshot) -> dict[str, Any]:

@@ -163,6 +163,7 @@ class SmolVLMWithExpertModel(nn.Module):
         use_observation_delay_adaln_zero: bool = False,
         use_noise_adarms: bool = False,
         use_tactile_adarms: bool = False,
+        tactile_residual_delta: bool = False,
         use_tactile_cross_attention: bool = False,
         use_tactile_self_attention: bool = True,
         use_modality_count_bias: bool = False,
@@ -230,6 +231,7 @@ class SmolVLMWithExpertModel(nn.Module):
 
         if use_tactile_adarms:
             for layer in self.lm_expert.layers:
+                layer.tactile_residual_delta = tactile_residual_delta
                 layer.tactile_adaln_zero = nn.ModuleDict(
                     {
                         branch: AdaptiveRMSNormZeroModulation(lm_expert_config.hidden_size)
@@ -413,7 +415,11 @@ class SmolVLMWithExpertModel(nn.Module):
             tactile_gated = layer.tactile_adaln_zero[branch].gate(residual, tactile_condition)
             # Sum learned gates: multiplying zero-initialized gates would block
             # gradients to both branches. Without another gate, tactile owns it.
-            return tactile_gated if gated is None else gated + tactile_gated
+            if gated is not None:
+                return gated + tactile_gated
+            if layer.tactile_residual_delta:
+                return residual + tactile_gated
+            return tactile_gated
         return residual if gated is None else gated
 
     @staticmethod

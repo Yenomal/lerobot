@@ -96,6 +96,7 @@ class ObservationSnapshot:
     execution_generation: int | None = None
     tactile_history: Mapping[str, np.ndarray] | None = None
     tactile_history_times: tuple[float, ...] = ()
+    tactile_hmm_state: int | None = None
 
     def __post_init__(self) -> None:
         """Copy camera buffers so asynchronous encoding sees a stable frame."""

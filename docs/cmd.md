@@ -367,6 +367,12 @@ attention / MLP 的独立 AdaLN-Zero 投影。底层保留 RMSNorm，计算
 相乘阻断梯度；触觉不调制最终输出 norm。`use_fm_tactile_token` 可独立开启。
 旧版 `use_tactile_adarms` 的输入相加实现已替换，旧触觉 checkpoint 需要重新训练或微调新增投影。
 
+用 UniVTac 的离散触觉状态调制 FM 时，训练配置同时开启 `use_tactile`、
+`use_tactile_adarms` 和 `use_tactile_hmm`。每个任务使用自己的 `meta/hmm.json`。
+训练在 DataLoader 出 batch 后按 episode 按需计算并在内存中缓存因果状态。
+Runtime 从 checkpoint 读取同一套 PCA 和 HMM 参数，每收一帧就更新状态概率，reset 或任务切换时重置。
+状态 ID 从 0 到 7，查表得到与 delay 条件同宽的 embedding。触觉残差 gate 从零增量开始。
+
 `use_noise_embedding` 控制 FM 输入端的 timestep 注入，默认 `true`：sin/cos 时间编码与
 action embedding 拼接后经过 MLP。设为 `false`（训练 CLI：`--policy.use_noise_embedding=false`）时，
 时间编码分支置零，保留 MLP 和 checkpoint 参数形状；动作加噪、timestep 采样与去噪积分照常执行。

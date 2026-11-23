@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -21,20 +22,57 @@ import torch
 from lerobot.processor import (
     NewLineTaskProcessorStep,
     NormalizerProcessorStep,
+    ObservationProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
+    ProcessorStepRegistry,
     TokenizerProcessorStep,
     make_default_policy_processor_steps,
     make_policy_processor_pipelines,
 )
 
 from .configuration_smolvla import SmolVLAConfig
+from .tactile_hmm import TACTILE_HMM_RAW, TACTILE_HMM_STATE
+
+
+@ProcessorStepRegistry.register(name="smolvla_tactile_hmm_raw")
+@dataclass
+class TactileHMMRawProcessorStep(ObservationProcessorStep):
+    """Keep raw markers alongside normalized inputs for direct policy inference."""
+
+    features: tuple[str, ...]
+
+    def observation(self, observation):
+        if TACTILE_HMM_STATE not in observation and all(key in observation for key in self.features):
+            for side, key in enumerate(self.features):
+                observation[f"{TACTILE_HMM_RAW}.{side}"] = observation[key]
+        return observation
+
+    def get_config(self) -> dict[str, Any]:
+        return {"features": list(self.features)}
+
+    def transform_features(self, features):
+        return features
 
 
 def configure_tactile_delta_preprocessor(
     config: SmolVLAConfig, preprocessor: PolicyProcessorPipeline
 ) -> None:
     """Keep marker coordinates raw until model-side subtraction; saved absolute stats do not apply."""
+    metadata = config.tactile_hmm_metadata
+    if (
+        config.use_tactile_hmm
+        and metadata is not None
+        and not config.use_tactile_delta
+        and not any(isinstance(step, TactileHMMRawProcessorStep) for step in preprocessor.steps)
+    ):
+        features = tuple(metadata.get("policy_features", metadata["features"]))
+        for index, step in enumerate(preprocessor.steps):
+            if isinstance(step, NormalizerProcessorStep):
+                steps = list(preprocessor.steps)
+                steps.insert(index, TactileHMMRawProcessorStep(features))
+                preprocessor.steps = steps
+                break
     if not config.use_tactile_delta:
         return
     for step in preprocessor.steps:
@@ -45,6 +83,8 @@ def configure_tactile_delta_preprocessor(
                 else step.normalize_observation_keys
             )
             tactile_keys = set(config.tactile_feature_names)
+            if config.tactile_hmm_metadata is not None:
+                tactile_keys.update(config.tactile_hmm_metadata.get("policy_features", ()))
             step.normalize_observation_keys = {
                 key for key in selected if "tactile" not in key.lower() and key not in tactile_keys
             }

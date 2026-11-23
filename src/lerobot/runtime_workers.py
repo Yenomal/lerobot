@@ -19,6 +19,8 @@ from lerobot.runtime_server import load_runtime_runner
 
 def _observation_metadata(observation: ObservationSnapshot) -> dict[str, Any]:
     metadata: dict[str, Any] = {"capture_time": observation.capture_time}
+    if observation.tactile_hmm_state is not None:
+        metadata["tactile_hmm_state"] = observation.tactile_hmm_state
     if observation.tactile_history is not None:
         metadata.update(
             tactile_history=dict(observation.tactile_history),
@@ -118,6 +120,7 @@ def _worker_main(
                     observation_id=str(request["sequence"]),
                     tactile_history=request.get("tactile_history"),
                     tactile_history_times=tuple(request.get("tactile_history_times", ())),
+                    tactile_hmm_state=request.get("tactile_hmm_state"),
                 )
                 prepared, cache = runner.encode_prefix(observation)
                 connection.send({"prepared": _cpu_tree(prepared), "cache": _encode_cache(cache)})
@@ -136,6 +139,7 @@ def _worker_main(
                     observation_id=str(request["sequence"]),
                     tactile_history=request.get("tactile_history"),
                     tactile_history_times=tuple(request.get("tactile_history_times", ())),
+                    tactile_hmm_state=request.get("tactile_hmm_state"),
                 )
                 result = runner.predict_from_prefix(
                     {},

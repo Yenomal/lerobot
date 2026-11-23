@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import logging
 import os
 from pathlib import Path
@@ -207,6 +208,10 @@ def make_pre_post_processors(
         if custom_processors is not None:
             return custom_processors
 
+        if policy_cfg.type == "smolvla":
+            # Register SmolVLA processor steps before deserializing them.
+            from .smolvla.processor_smolvla import configure_tactile_delta_preprocessor
+
         processors = load_pretrained_policy_processors(
             pretrained_path,
             revision=pretrained_revision,
@@ -216,8 +221,6 @@ def make_pre_post_processors(
             postprocessor_config_filename=postprocessor_config_filename,
         )
         if policy_cfg.type == "smolvla":
-            from .smolvla.processor_smolvla import configure_tactile_delta_preprocessor
-
             configure_tactile_delta_preprocessor(policy_cfg, processors[0])
         return processors
 
@@ -389,6 +392,24 @@ def make_policy(
                 }
             set_dataset_feature_metadata(ds_feature)
         cfg._runtime_dataset_meta = ds_meta
+        if cfg.type == "smolvla" and getattr(cfg, "use_tactile_hmm", False):
+            from .smolvla.configuration_smolvla import SmolVLAConfig
+
+            assert isinstance(cfg, SmolVLAConfig)
+            path = ds_meta.root / "meta" / "hmm.json"
+            parameters = json.loads(path.read_text(encoding="utf-8"))
+            parameters["policy_features"] = [
+                (rename_map or {}).get(key, key) for key in parameters["features"]
+            ]
+            if cfg.tactile_hmm_metadata is not None and cfg.tactile_hmm_metadata != parameters:
+                raise ValueError(f"Tactile HMM metadata in the checkpoint differs from {path}")
+            cfg.tactile_hmm_metadata = parameters
+            for raw_key, policy_key in zip(
+                parameters["features"], parameters["policy_features"], strict=True
+            ):
+                if raw_key not in ds_meta.features or policy_key not in features:
+                    raise ValueError(f"Tactile HMM marker feature {raw_key!r} is missing from {ds_meta.root}")
+                cfg.input_features[policy_key] = features[policy_key]
 
     kwargs["config"] = cfg
 

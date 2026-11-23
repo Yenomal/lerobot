@@ -90,6 +90,7 @@ from ..utils import (
 from .configuration_smolvla import SmolVLAConfig
 from .smolvlm_with_expert import SmolVLMWithExpertModel
 from .tactile_cfg_logging import TactileCFGLambdaLogger
+from .tactile_hmm import TACTILE_HMM_RAW, TACTILE_HMM_STATE, TACTILE_HMM_STATES, TactileHMM
 
 
 def normalize(x, min_val, max_val):
@@ -332,6 +333,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         }
         self._tactile_history = {}
         self._vlm_tactile_history = {}
+        self._tactile_hmm_posterior = None
+        self._tactile_hmm_tasks = None
         self._random_tactile_generators: dict[str, torch.Generator] = {}
         model_value = getattr(self, "model", None)
         if model_value is not None:
@@ -475,6 +478,40 @@ class SmolVLAPolicy(PreTrainedPolicy):
             batch = self._randomize_tactile_batch(batch)
         if self.config.adapt_to_pi_aloha:
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
+
+        if (
+            self.config.use_tactile_hmm
+            and not self.training
+            and update_tactile_history
+            and tactile_history_store is None
+            and TACTILE_HMM_STATE not in batch
+        ):
+            # Direct rollout calls can supply raw markers without a Runtime session.
+            if getattr(self, "_tactile_hmm", None) is None:
+                if self.config.tactile_hmm_metadata is None:
+                    raise ValueError("Missing PCA/HMM parameters for tactile conditioning")
+                self._tactile_hmm = TactileHMM(self.config.tactile_hmm_metadata)
+            task = batch.get("task")
+            tasks = tuple(task) if isinstance(task, (tuple, list)) else task
+            markers = []
+            for side, key in enumerate(self._tactile_hmm.policy_features):
+                value = batch.get(f"{TACTILE_HMM_RAW}.{side}", batch[key])
+                markers.append(value.detach().to(device="cpu", dtype=torch.float64).numpy())
+            markers = [value[:, -1] if value.ndim == 5 else value for value in markers]
+            emission = self._tactile_hmm.log_emissions(*markers)
+            previous = self._tactile_hmm_posterior
+            if tasks != self._tactile_hmm_tasks or (
+                previous is not None and previous.shape != emission.shape
+            ):
+                self._tactile_hmm_posterior = None
+            self._tactile_hmm_tasks = tasks
+            self._tactile_hmm_posterior = self._tactile_hmm.update(emission, self._tactile_hmm_posterior)
+            state_id = torch.as_tensor(
+                self._tactile_hmm_posterior.argmax(axis=-1),
+                dtype=torch.long,
+                device=batch[OBS_STATE].device,
+            ).reshape(-1)
+            batch = {**batch, TACTILE_HMM_STATE: state_id}
 
         max_delay = max(self.config.observation_delay_max_chunks, self.config.observation_delay_max_tokens)
         if max_delay:
@@ -930,6 +967,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         )
         if self.config.use_noise_adarms and not self.config.use_noise_embedding:
             common_projections = common_projections.replace("action_time_mlp_in|action_time_mlp_out|", "")
+        if self.config.use_tactile_hmm:
+            common_projections = common_projections.replace("tactile_adarms|", "")
         target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
         modules_to_save = []
         if (
@@ -955,6 +994,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 for name, module in self.named_modules()
                 if isinstance(module, nn.Embedding) and name.endswith("tactile_finger_embedding")
             )
+        if self.config.use_tactile_hmm:
+            modules_to_save.append("model.tactile_adarms")
         return {
             "target_modules": target_modules,
             "modules_to_save": modules_to_save,
@@ -1044,6 +1085,7 @@ class VLAFlowMatching(nn.Module):
             use_observation_delay_adaln_zero=self.config.use_observation_delay_adaln_zero,
             use_noise_adarms=self.config.use_noise_adarms,
             use_tactile_adarms=self.config.use_tactile_adarms,
+            tactile_residual_delta=self.config.use_tactile_hmm,
             use_tactile_cross_attention=self.config.use_tactile_cross_attention,
             use_tactile_self_attention=self.config.use_tactile_self_attention,
             use_modality_count_bias=self.config.use_modality_count_bias,
@@ -1118,10 +1160,14 @@ class VLAFlowMatching(nn.Module):
             # marker layout (2 x 63 x 2 per hand) and flattened tactile arrays
             # from other datasets without hard-coding a sensor width.
             tactile_hidden = self.vlm_with_expert.expert_hidden_size
-            self.tactile_encoder = nn.Sequential(
-                nn.LazyLinear(tactile_hidden),
-                nn.SiLU(),
-                nn.Linear(tactile_hidden, tactile_hidden),
+            self.tactile_encoder = (
+                nn.Sequential(
+                    nn.LazyLinear(tactile_hidden),
+                    nn.SiLU(),
+                    nn.Linear(tactile_hidden, tactile_hidden),
+                )
+                if not config.use_tactile_hmm or config.use_fm_tactile_token
+                else None
             )
             self.tactile_finger_embedding = (
                 nn.Embedding(2, tactile_hidden) if self.config.use_tactile_finger_tokens else None
@@ -1137,17 +1183,16 @@ class VLAFlowMatching(nn.Module):
                 self.tactile_token_tcn_1 = None
                 self.tactile_token_tcn_2 = None
                 self.tactile_token_out = None
-            self.tactile_adarms = (
-                nn.Sequential(
-                    nn.Linear(tactile_hidden, self.vlm_with_expert.expert_hidden_size),
+            if config.use_tactile_hmm:
+                self.tactile_adarms = nn.Embedding(TACTILE_HMM_STATES, tactile_hidden)
+            elif config.use_tactile_adarms:
+                self.tactile_adarms = nn.Sequential(
+                    nn.Linear(tactile_hidden, tactile_hidden),
                     nn.SiLU(),
-                    nn.Linear(
-                        self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
-                    ),
+                    nn.Linear(tactile_hidden, tactile_hidden),
                 )
-                if self.config.use_tactile_adarms
-                else None
-            )
+            else:
+                self.tactile_adarms = None
         else:
             self.tactile_encoder = None
             self.tactile_adarms = None
@@ -1448,7 +1493,10 @@ class VLAFlowMatching(nn.Module):
         enabled = (
             getattr(self.config, "use_vlm_tactile_token", False)
             if vlm
-            else (self.config.use_fm_tactile_token or self.config.use_tactile_adarms)
+            else (
+                self.config.use_fm_tactile_token
+                or (self.config.use_tactile_adarms and not self.config.use_tactile_hmm)
+            )
         )
         if not self.config.use_tactile or not enabled:
             return None
@@ -1541,6 +1589,10 @@ class VLAFlowMatching(nn.Module):
         """Project the current frame for per-layer tactile AdaLN-Zero conditioning."""
         if self.tactile_adarms is None:
             return None
+        if self.config.use_tactile_hmm:
+            if TACTILE_HMM_STATE not in batch:
+                raise ValueError("Missing causal tactile HMM state for AdaLN-Zero")
+            return self.tactile_adarms(batch[TACTILE_HMM_STATE].reshape(-1).long())
         frames = self._encode_tactile_frames(batch)
         if frames is None:
             return None

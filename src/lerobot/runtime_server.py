@@ -20,6 +20,7 @@ from lerobot.configs import PreTrainedConfig
 from lerobot.configs.types import FeatureType
 from lerobot.inference import ExecutionMode, FeatureSpec, ObservationSnapshot, PolicyRunner
 from lerobot.policies import get_policy_class, make_pre_post_processors
+from lerobot.policies.smolvla.tactile_hmm import TactileHMM
 from lerobot.runtime_protocol import PROTOCOL_VERSION, read_message, write_message
 from lerobot.transport.protocol import Envelope, ErrorCode, MessageType
 
@@ -186,6 +187,12 @@ class RuntimeSession:
         self.tactile_cfg_lambda = float(tactile_cfg_lambda)
         self.execution_id = 0
         config = runner.policy.config
+        self._tactile_hmm = None
+        self._tactile_hmm_posterior = None
+        if getattr(config, "use_tactile_hmm", False):
+            if config.tactile_hmm_metadata is None:
+                raise ValueError("The checkpoint is missing tactile PCA/HMM parameters")
+            self._tactile_hmm = TactileHMM(config.tactile_hmm_metadata)
         lengths = [1]
         for branch, enabled in (("fm", "use_fm_tactile_token"), ("vlm", "use_vlm_tactile_token")):
             if getattr(config, enabled, False):
@@ -325,6 +332,7 @@ class RuntimeSession:
         self.task = None
         self.execution_id = 0
         self._tactile_history.clear()
+        self._tactile_hmm_posterior = None
         if self._prefix_future is not None:
             self._prefix_future.cancel()
         self._prefix_future = None
@@ -355,6 +363,7 @@ class RuntimeSession:
             self.runner.reset(full=True)
             self.execution_id = 0
             self._tactile_history.clear()
+            self._tactile_hmm_posterior = None
             if self._prefix_future is not None:
                 self._prefix_future.cancel()
             self._prefix_future = None
@@ -406,6 +415,13 @@ class RuntimeSession:
         """
         now = time.monotonic()
         config = self.runner.policy.config
+        hmm_state = None
+        if self._tactile_hmm is not None:
+            emission = self._tactile_hmm.log_emissions(
+                *(features[key] for key in self._tactile_hmm.policy_features)
+            )
+            self._tactile_hmm_posterior = self._tactile_hmm.update(emission, self._tactile_hmm_posterior)
+            hmm_state = int(self._tactile_hmm_posterior.argmax())
         enabled = getattr(config, "use_fm_tactile_token", False) or getattr(
             config, "use_vlm_tactile_token", False
         )
@@ -429,6 +445,7 @@ class RuntimeSession:
             observation_id=str(sequence),
             tactile_history=history,
             tactile_history_times=times,
+            tactile_hmm_state=hmm_state,
         )
 
 

@@ -40,6 +40,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from accelerate import Accelerator
 
+    from lerobot.policies.smolvla.tactile_hmm import DatasetTactileHMM
+
 import torch
 from termcolor import colored
 from torch.optim import Optimizer
@@ -174,11 +176,16 @@ def _preprocess_dataset_batch(
     camera_keys: list[str],
     rename_map: dict[str, str],
     preprocessor: Any,
+    tactile_hmm: "DatasetTactileHMM | None" = None,
 ) -> Any:
     """Prepare a raw dataset batch identically for training and held-out evaluation."""
     for cam_key in camera_keys:
         if cam_key in batch and batch[cam_key].dtype == torch.uint8:
             batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
+    if tactile_hmm is not None:
+        from lerobot.policies.smolvla.tactile_hmm import TACTILE_HMM_STATE
+
+        batch[TACTILE_HMM_STATE] = tactile_hmm(batch)
     batch = rename_batch_keys(batch, rename_map)
     return preprocessor(batch)
 
@@ -639,6 +646,15 @@ def train(cfg: TrainPipelineConfig) -> None:
             pretrained_path=resume_pretrained_dir,
         )
 
+    tactile_hmm = None
+    if getattr(active_cfg, "use_tactile_hmm", False):
+        from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+        from lerobot.policies.smolvla.tactile_hmm import DatasetTactileHMM, TactileHMM
+
+        assert isinstance(active_cfg, SmolVLAConfig)
+        assert active_cfg.tactile_hmm_metadata is not None
+        tactile_hmm = DatasetTactileHMM(dataset.meta, TactileHMM(active_cfg.tactile_hmm_metadata))
+
     initialize_lazy_parameters = getattr(policy, "initialize_lazy_parameters", None)
     if callable(initialize_lazy_parameters):
         initialize_lazy_parameters()
@@ -867,7 +883,9 @@ def train(cfg: TrainPipelineConfig) -> None:
         train_tracker.dataloading_s = preprocessing_start - step_start
         if image_augmentation is not None:
             batch = image_augmentation.observation(batch)
-        batch = _preprocess_dataset_batch(batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor)
+        batch = _preprocess_dataset_batch(
+            batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor, tactile_hmm
+        )
         train_tracker.preprocessing_s = time.perf_counter() - preprocessing_start
 
         train_tracker, _ = update_policy(
@@ -923,7 +941,7 @@ def train(cfg: TrainPipelineConfig) -> None:
             with torch.no_grad(), accelerator.autocast():
                 for eval_batch in eval_dataloader:
                     eval_batch = _preprocess_dataset_batch(
-                        eval_batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor
+                        eval_batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor, tactile_hmm
                     )
                     loss, _ = policy(eval_batch)  # __call__, so FSDP2 forward hooks run
                     eval_loss_sum += loss.item()

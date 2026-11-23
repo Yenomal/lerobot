@@ -127,7 +127,7 @@ def test_history_is_normalized_under_original_feature_key():
 
 
 @pytest.mark.parametrize("role", ["vlm", "fm"])
-def test_worker_transport_preserves_raw_history_and_times(monkeypatch, role):
+def test_worker_transport_preserves_tactile_history_and_hmm_state(monkeypatch, role):
     seen, requests = [], []
     proxy = ProcessStreamingRunner.__new__(ProcessStreamingRunner)
     proxy._vlm_lock = Lock()
@@ -144,6 +144,7 @@ def test_worker_transport_preserves_raw_history_and_times(monkeypatch, role):
         observation_id="7",
         tactile_history={KEY: np.stack([features(i)[KEY] for i in (1, 2, 3)])},
         tactile_history_times=(1, 2, 3),
+        tactile_hmm_state=6,
     )
     if role == "vlm":
         proxy.encode_prefix(snapshot)
@@ -173,4 +174,5 @@ def test_worker_transport_preserves_raw_history_and_times(monkeypatch, role):
     )
     np.testing.assert_array_equal(seen[0].tactile_history[KEY], snapshot.tactile_history[KEY])
     assert seen[0].tactile_history_times == (1, 2, 3)
+    assert seen[0].tactile_hmm_state == 6
     assert seen[0].capture_time == 3
