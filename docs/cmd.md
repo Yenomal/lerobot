@@ -259,10 +259,16 @@ policy:
   observation_delay_zero_bypass: false
   use_observation_delay_token: false
   use_tactile: false
-  use_tactile_delta: false  # Raw current-baseline displacement, bypassing absolute marker normalization.
+  tactile_normalization: legacy  # image_size scales marker x/y by 320/240 before encoding.
+  use_tactile_delta: false  # Subtract baseline after tactile preprocessing.
   use_tactile_finger_tokens: false  # Separate finger tokens, learned left=0/right=1 embeddings.
   use_tactile_adarms: false  # AdaLN-Zero: per-layer RMSNorm scale/shift + zero residual gates.
   use_fm_tactile_token: false
+  use_fm_tactile_summary_token: false
+  fm_tactile_summary_only: true
+  use_fm_tactile_summary_aux_loss: false
+  fm_tactile_summary_aux_weight: 0.0
+  fm_tactile_stop_gradient_to_vlm: false
   use_tactile_ca0: true  # Legacy CA0 isolation by default; false uses direct first-chunk tactile.
   use_vlm_tactile_token: false  # Independent tactile MLP/TCN and projector in the VLM prefix.
   vlm_tactile_reads_state: false  # True allows VLM tactile queries to read state tokens.
@@ -480,9 +486,28 @@ K/V，但仍读取图像、语言和 state。此规则按动作位置选择，�
 这里屏蔽的是直接 attention 边：图文 K/V 可能已融合 VLM 触觉，其它 action 也可能通过 action–action
 attention 间接获得 FM 触觉。现有 action–action mask 保持不变。
 两种模式均保持原有触觉内部双向/因果 mask、TCN、历史长度、clean time 和 delay 控制。
-无 CA0 时 loss 仅为普通 action 的 flow-matching MSE，不增加 CA0 重建项或 CA0/A0 对比指标。
+无 CA0 时，普通 action 的 flow-matching MSE 无额外 CA0 重建项或 CA0/A0 对比指标。
 `use_tactile_cfg_gate` 和三个 `stream-head-*-tactile*` 模式依赖 CA0，关闭时会明确报错。
 旧 checkpoint 缺少 `use_tactile_ca0` 字段时默认使用 `true`；已保存的显式 `false` 仍保持无 CA0 模式。
+
+`use_fm_tactile_summary_token=true` 在 FM 触觉历史和 CA0/action 之间追加一个可学习的
+汇总 token `S`。它读取整个触觉 block，沿用 FM 触觉读取 VLM prefix 的规则，
+与最新触觉帧共用 RoPE 位置。历史触觉不能读取 `S`。开启
+`fm_tactile_summary_only` 时，CA0 或首个执行 chunk 只从 `S` 获取 FM 触觉，
+要求关闭 `use_tactile_adarms`。设为 `false` 时动作可同时读 `S` 和触觉历史。
+两种模式均沿用 FM 的 self/cross-attention 开关。
+
+`use_fm_tactile_summary_aux_loss=true` 启用一个 MLP，从最终 `S` hidden state 并行重建
+当前帧左右指特征，并预测 +5/+10/+15 帧相对当前帧的特征变化。预测误差按有效 offset
+归约后乘以 `fm_tactile_summary_aux_weight`，再加到动作 loss。未来帧只用于辅助标签，
+越过 episode 的位置从 loss 中排除。开关关闭时不会构建预测头，也不会请求未来触觉帧。
+Runtime 只运行策略，预测头不参与出动作。
+训练日志会分别记录 `action_loss`、加权后的 `tactile/summary_aux_loss` 和总 `loss`。
+训练输出目录下会持续追加 `training_metrics.jsonl`，每个 `log_freq` 周期保存一条 rank-reduced
+训练记录。断点续训会继续追加到同一个文件。
+
+`fm_tactile_stop_gradient_to_vlm=true` 使 FM 触觉及 `S` query 读取 stop-gradient 的
+VLM prefix K/V。动作和 CA0 直接读取 prefix 的梯度保留，FM 的 cross K/V 投影仍可训练。
 `fm_tactile_token_history_length` 和 `vlm_tactile_token_history_length` 分别指定两侧包含当前帧的历史长度。
 两者默认 `null`，各自回退到旧配置 `tactile_token_history_length`（默认 1），兼容已有实验与 checkpoint。
 显式设置任意一侧的新字段只覆盖该侧，另一侧保持自己的配置或兼容回退值。
@@ -537,10 +562,12 @@ marker 位移输入实验使用 `policy.use_tactile_delta: true`（默认 `false
 `[baseline/current, 63 markers, x/y]`；在模型中逐 marker 计算 `current - baseline`，
 每指由 252 维降至 126 维，两指仍按左、右顺序拼接，MLP 输入从 504 维变为 252 维。
 该开关同时作用于 VLM/FM 各自的 MLP、TCN 输入和重建目标，不改变历史长度及 token 数量。
-processor 对触觉坐标跳过原有绝对坐标的归一化，保留原始坐标单位，确保减法发生在原始空间；
-state/action 等其余归一化不变。当前未额外估计位移的均值/标准差，位移重建 loss 的量纲也相应改变。
-数据集和 Runtime 仍提供原始 `[2,63,2]`，不在客户端提前计算位移。新模型须训练对应输入层，
-不能将 504 维输入的旧触觉 MLP 直接用于 252 维位移模式。旧 checkpoint 默认关闭该开关。
+
+`policy.tactile_normalization: image_size` 在 processor 里将 baseline 和 current 的 x/y
+分别除以 320 和 240，适用于当前帧和历史帧。模型随后按 `use_tactile_delta` 决定是否相减，
+两种输入共用相同的坐标尺度。`legacy` 保留旧 checkpoint 的输入尺度，绝对坐标采用数据集归一化，
+位移使用原始坐标差。state/action 继续使用各自的归一化。数据集和 Runtime 提供原始 `[2,63,2]`。
+归一化模式随 checkpoint 保存。切换绝对坐标和位移会改变 MLP 的输入维度。
 
 单指独立 token 模式使用 `policy.use_tactile_finger_tokens: true`（默认 `false`）：
 

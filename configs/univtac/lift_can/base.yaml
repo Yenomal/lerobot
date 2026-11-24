@@ -19,6 +19,7 @@ policy:
   push_to_hub: false
   use_noise_adarms: true
   use_noise_embedding: false
+  tactile_normalization: image_size
 
 rename_map:
   observation.images.head: observation.images.camera1

@@ -1,6 +1,7 @@
-"""Physical marker displacement, independent of absolute-coordinate normalization."""
+"""Marker displacement and its coordinate normalization."""
 
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +13,7 @@ from lerobot.lerobot_types import TransitionKey
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy, VLAFlowMatching
-from lerobot.policies.smolvla.processor_smolvla import configure_tactile_delta_preprocessor
+from lerobot.policies.smolvla.processor_smolvla import configure_tactile_preprocessor
 from lerobot.processor import NormalizerProcessorStep
 from tests.policies.smolvla import test_delay_adarms
 
@@ -107,8 +108,71 @@ def test_saved_processor_stats_do_not_distort_delta(monkeypatch):
         result["observation.state"], (raw["observation.state"] - 10) / (3 + normalizer.eps)
     )
     assert normalizer.get_config()["normalize_observation_keys"] == ["observation.state"]
-    configure_tactile_delta_preprocessor(config, pipeline)
+    configure_tactile_preprocessor(config, pipeline)
     assert normalizer.normalize_observation_keys == {"observation.state"}
+
+
+@pytest.mark.parametrize("delta", [False, True])
+def test_image_size_normalization_saved_processor_and_model_input(make_model, monkeypatch, tmp_path, delta):
+    class StubTokenizer:
+        def __call__(self, *args, **kwargs):
+            return {"input_ids": torch.ones(1, 2, dtype=torch.long), "attention_mask": torch.ones(1, 2)}
+
+        def save_pretrained(self, directory: Path) -> None:
+            directory.mkdir(exist_ok=True)
+
+    monkeypatch.setattr(
+        "lerobot.processor.tokenizer_processor.AutoTokenizer.from_pretrained", lambda _: StubTokenizer()
+    )
+    config = replace(
+        make_model(tactile=True, enabled=False).config,
+        use_tactile_delta=delta,
+        tactile_normalization="image_size",
+        tactile_token_history_length=5,
+        input_features={
+            **marker_features(),
+            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(6,)),
+        },
+    )
+    stats = {
+        key: {"mean": torch.full(feature.shape, 10.0), "std": torch.full(feature.shape, 2.0)}
+        for key, feature in config.input_features.items()
+    }
+    preprocessor, postprocessor = make_pre_post_processors(config, dataset_stats=stats)
+    config.save_pretrained(tmp_path)
+    preprocessor.save_pretrained(tmp_path)
+    postprocessor.save_pretrained(tmp_path)
+    loaded_config = SmolVLAConfig.from_pretrained(tmp_path)
+    loaded, _ = make_pre_post_processors(loaded_config, pretrained_path=tmp_path)
+
+    raw = {
+        key: torch.tensor([[80.0, 120.0], [160.0, 180.0]])[None, None, :, None].expand(1, 5, 2, 63, 2)
+        for key in marker_features()
+    }
+    padding = {
+        f"{key}_is_pad": torch.tensor([[True, True, False, False, False]]) for key in marker_features()
+    }
+    raw["observation.state"] = torch.full((1, 6), 14.0)
+    batch = {**raw, **padding, "task": ["insert the peg"]}
+    fresh, restored = preprocessor(batch), loaded(batch)
+    for key in marker_features():
+        torch.testing.assert_close(fresh[key][0, 0, :, 0], torch.tensor([[0.25, 0.5], [0.5, 0.75]]))
+        torch.testing.assert_close(restored[key], fresh[key])
+    for key, mask in padding.items():
+        torch.testing.assert_close(fresh[key], mask)
+        torch.testing.assert_close(restored[key], mask)
+    torch.testing.assert_close(restored["observation.state"], torch.full((1, 6), 2.0))
+
+    model = VLAFlowMatching(loaded_config)
+    inputs = []
+    with model.tactile_encoder.register_forward_pre_hook(lambda module, args: inputs.append(args[0])):
+        model._encode_tactile(restored)
+    expected = (
+        torch.full((5, 252), 0.25)
+        if delta
+        else torch.cat([fresh[key].flatten(2) for key in marker_features()], dim=-1).squeeze(0)
+    )
+    torch.testing.assert_close(inputs[0], expected)
 
 
 def test_delta_reconstruction_target_and_legacy_config(make_model, tmp_path):

@@ -29,11 +29,15 @@ torchrun --nproc-per-node=8 $(which lerobot-train) \
 """
 
 import dataclasses
+import json
 import logging
+import os
 import sys
 import time
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from datetime import UTC, datetime
+from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -118,6 +122,20 @@ if TYPE_CHECKING or _accelerate_available:
     from accelerate.utils import send_to_device
 
 from .lerobot_eval import eval_policy_all
+
+
+def _append_training_metrics(path: Path, metrics: dict[str, Any]) -> None:
+    """Append one rank-reduced training metrics snapshot as a durable JSONL record."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        **metrics,
+    }
+    with path.open("a", encoding="utf-8") as file:
+        json.dump(record, file, ensure_ascii=False, allow_nan=True)
+        file.write("\n")
+        file.flush()
+        os.fsync(file.fileno())
 
 
 @contextmanager
@@ -750,6 +768,7 @@ def train(cfg: TrainPipelineConfig) -> None:
     if cfg.output_dir is None or cfg.optimizer is None:
         # validate() resolves `output_dir` and make_optimizer_and_scheduler() rejects a missing optimizer.
         raise ValueError("`output_dir` and `optimizer` must be resolved before training starts.")
+    training_metrics_path = cfg.output_dir / "training_metrics.jsonl"
 
     # --- resume phase 1 + dataloaders ----------------------------------------------------------
     step = 0  # number of loop steps (= micro-batches consumed per data-parallel worker)
@@ -807,6 +826,7 @@ def train(cfg: TrainPipelineConfig) -> None:
         num_learnable_params = count_parameters(policy.parameters(), trainable_only=True)
         num_total_params = count_parameters(policy.parameters())
         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
+        logging.info(f"Training metrics will be appended to {training_metrics_path}")
         if cfg.env is not None:
             logging.info(f"{cfg.env.task=}")
             logging.info("Creating environment processors")
@@ -919,6 +939,10 @@ def train(cfg: TrainPipelineConfig) -> None:
                 if train_tracker.step_s.avg > 0:
                     train_tracker.samples_per_s = samples_per_step / train_tracker.step_s.avg
                 logging.info(train_tracker)
+                try:
+                    _append_training_metrics(training_metrics_path, train_tracker.to_dict())
+                except OSError:
+                    logging.exception("Could not append training metrics to %s", training_metrics_path)
                 if trackio_logger:
                     # Policy sub-losses (latent_loss, action_loss, ...) are aggregated into the
                     # tracker by update_policy, so to_dict() already carries their windowed,

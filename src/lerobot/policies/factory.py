@@ -210,7 +210,7 @@ def make_pre_post_processors(
 
         if policy_cfg.type == "smolvla":
             # Register SmolVLA processor steps before deserializing them.
-            from .smolvla.processor_smolvla import configure_tactile_delta_preprocessor
+            from .smolvla.processor_smolvla import configure_tactile_preprocessor
 
         processors = load_pretrained_policy_processors(
             pretrained_path,
@@ -221,7 +221,7 @@ def make_pre_post_processors(
             postprocessor_config_filename=postprocessor_config_filename,
         )
         if policy_cfg.type == "smolvla":
-            configure_tactile_delta_preprocessor(policy_cfg, processors[0])
+            configure_tactile_preprocessor(policy_cfg, processors[0])
         return processors
 
     # Create new processors from the policy config, resolving the per-policy factory

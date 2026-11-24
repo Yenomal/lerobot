@@ -1,0 +1,11 @@
+schema_version: 1
+extends: base.yaml
+
+exp_name: "20261124_005"
+scripts: "baseline stream-head"
+
+policy:
+  streaming: true
+  streaming_attention_mode: bidirectional
+  n_obs_steps: 21
+  observation_delay_max_tokens: 20

@@ -14,7 +14,7 @@
 
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
@@ -22,6 +22,8 @@ from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 from lerobot.utils.feature_utils import dataset_to_policy_features
 
 from ..rtc.configuration_rtc import RTCConfig
+
+FM_TACTILE_SUMMARY_OFFSETS = (0, 5, 10, 15)
 
 
 @PreTrainedConfig.register_subclass("smolvla")
@@ -73,7 +75,9 @@ class SmolVLAConfig(PreTrainedConfig):
     # Tactile conditioning. The feature names are intentionally configurable
     # because UniVTAC datasets use both dotted and flat naming conventions.
     use_tactile: bool = False
-    # Encode raw current-minus-baseline marker displacement instead of both coordinates.
+    # "image_size" scales marker x/y by 320/240 before the model sees them.
+    tactile_normalization: Literal["legacy", "image_size"] = "legacy"
+    # Subtract the preprocessed baseline from the preprocessed current coordinates.
     use_tactile_delta: bool = False
     # One token per finger, with shared per-branch encoder and learned finger IDs.
     use_tactile_finger_tokens: bool = False
@@ -84,6 +88,13 @@ class SmolVLAConfig(PreTrainedConfig):
     # Populated from dataset meta/hmm.json and saved with the policy for inference.
     tactile_hmm_metadata: dict[str, Any] | None = field(default=None, repr=False)
     use_fm_tactile_token: bool = False
+    use_fm_tactile_summary_token: bool = False
+    # Action receivers read S only, or both the history tokens and S.
+    fm_tactile_summary_only: bool = True
+    use_fm_tactile_summary_aux_loss: bool = False
+    fm_tactile_summary_aux_weight: float = 0.0
+    # Stop prefix K/V gradients from FM tactile queries while retaining their values.
+    fm_tactile_stop_gradient_to_vlm: bool = False
     # True: isolated CA0 branch. False: first execution chunk reads live FM tactile.
     use_tactile_ca0: bool = True
     # Independent tactile encoder in the VLM prefix, appended after state.
@@ -272,6 +283,19 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError("use_tactile_finger_tokens requires use_tactile=True")
         if self.use_fm_tactile_token and not self.use_tactile:
             raise ValueError("use_fm_tactile_token requires use_tactile=True")
+        if (self.use_fm_tactile_summary_token or self.fm_tactile_stop_gradient_to_vlm) and (
+            not self.use_fm_tactile_token
+        ):
+            raise ValueError("FM tactile summary and stop-gradient require use_fm_tactile_token=True")
+        if self.use_fm_tactile_summary_token and self.fm_tactile_summary_only and self.use_tactile_adarms:
+            raise ValueError("fm_tactile_summary_only requires use_tactile_adarms=False")
+        if not math.isfinite(self.fm_tactile_summary_aux_weight) or self.fm_tactile_summary_aux_weight < 0:
+            raise ValueError("fm_tactile_summary_aux_weight must be finite and non-negative")
+        if self.use_fm_tactile_summary_aux_loss:
+            if not self.use_fm_tactile_summary_token:
+                raise ValueError("fm_tactile_summary_aux_weight requires use_fm_tactile_summary_token=True")
+            if self.use_tactile_cfg_gate or self.use_tactile_reconstruction:
+                raise ValueError("FM tactile summary auxiliary loss requires joint policy training")
         if self.use_vlm_tactile_token and not self.use_tactile:
             raise ValueError("use_vlm_tactile_token requires use_tactile=True")
         if not self.vlm_context_reads_tactile and not self.use_vlm_tactile_token:
@@ -439,7 +463,10 @@ class SmolVLAConfig(PreTrainedConfig):
                 self.observation_delay_max_chunks * self.streaming_chunk_size,
             )
             count = max(count, vlm_count)
-        return list(range(-(count - 1), 1))
+        indices = list(range(-(count - 1), 1))
+        if self.use_fm_tactile_summary_aux_loss:
+            indices.extend(FM_TACTILE_SUMMARY_OFFSETS[1:])
+        return indices
 
     def get_tactile_history_length(self, *, vlm: bool = False) -> int:
         value = self.vlm_tactile_token_history_length if vlm else self.fm_tactile_token_history_length

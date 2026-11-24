@@ -11,10 +11,14 @@ pytestmark = pytest.mark.dataset
 
 
 @pytest.mark.parametrize("tcn", [False, True])
-def test_tactile_delta_indices_match_configured_length_in_both_modes(tcn):
+@pytest.mark.parametrize("predict", [False, True])
+def test_tactile_delta_indices_match_configured_length_in_both_modes(tcn, predict):
     config = SmolVLAConfig(
         use_tactile=True,
         use_fm_tactile_token=True,
+        use_fm_tactile_summary_token=predict,
+        use_fm_tactile_summary_aux_loss=predict,
+        fm_tactile_summary_aux_weight=float(predict),
         use_tactile_tcn=tcn,
         tactile_token_history_length=10,
         n_obs_steps=1,
@@ -34,6 +38,8 @@ def test_tactile_delta_indices_match_configured_length_in_both_modes(tcn):
     )
     assert timestamps["observation.state"] == timestamps["observation.images.head"] == [0.0]
     expected = [i / 30 for i in range(-9, 1)]
+    if predict:
+        expected.extend(i / 30 for i in (5, 10, 15))
     assert (
         timestamps["observation.markers.left"] == timestamps["observation.tactile.right_marker"] == expected
     )

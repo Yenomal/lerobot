@@ -167,6 +167,7 @@ class SmolVLMWithExpertModel(nn.Module):
         use_tactile_cross_attention: bool = False,
         use_tactile_self_attention: bool = True,
         use_modality_count_bias: bool = False,
+        fm_tactile_stop_gradient_to_vlm: bool = False,
     ):
         super().__init__()
         require_package("transformers", extra="smolvla")
@@ -277,6 +278,7 @@ class SmolVLMWithExpertModel(nn.Module):
         self.attention_mode = attention_mode
         self.use_modality_count_bias = use_modality_count_bias
         self.use_tactile_self_attention = use_tactile_self_attention
+        self.fm_tactile_stop_gradient_to_vlm = fm_tactile_stop_gradient_to_vlm
         self.expert_hidden_size = lm_expert_config.hidden_size
         self.set_requires_grad()
 
@@ -449,6 +451,43 @@ class SmolVLMWithExpertModel(nn.Module):
         bias = torch.cat(parts, dim=-1)
         return F.pad(bias, (0, 0, fm_query_start, 0))
 
+    def _attend_with_detached_tactile_prefix(
+        self,
+        attention_mask: torch.Tensor,
+        batch_size: int,
+        head_dim: int,
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        attention_bias: torch.Tensor | None,
+        tactile_query_start: int,
+        tactile_token_count: int,
+        tactile_keys: torch.Tensor,
+        tactile_values: torch.Tensor,
+    ) -> torch.Tensor:
+        """Use the detached prefix only on FM tactile query rows."""
+        attention = self.get_attention_interface()
+        end = tactile_query_start + tactile_token_count
+        groups = (
+            (slice(0, tactile_query_start), keys, values),
+            (slice(tactile_query_start, end), tactile_keys, tactile_values),
+            (slice(end, queries.shape[1]), keys, values),
+        )
+        outputs = [
+            attention(
+                attention_mask[:, rows],
+                batch_size,
+                head_dim,
+                queries[:, rows],
+                group_keys,
+                group_values,
+                attention_bias[:, rows] if attention_bias is not None else None,
+            )
+            for rows, group_keys, group_values in groups
+            if rows.start < rows.stop
+        ]
+        return torch.cat(outputs, dim=1)
+
     def forward_attn_layer(
         self,
         model_layers,
@@ -566,11 +605,32 @@ class SmolVLMWithExpertModel(nn.Module):
                 fm_query_start=query_states.shape[1] - suffix_length,
             )
             _attention_bias = count_bias if _attention_bias is None else _attention_bias + count_bias
-        attention_interface = self.get_attention_interface()
-
-        att_output = attention_interface(
-            attention_mask_, batch_size, head_dim, query_states, key_states, value_states, _attention_bias
-        )
+        if (
+            self.fm_tactile_stop_gradient_to_vlm
+            and torch.is_grad_enabled()
+            and tactile_token_index is not None
+            and inputs_embeds[1] is not None
+            and model_layers[1][layer_idx] is not None
+        ):
+            suffix_length = inputs_embeds[1].shape[1]
+            prefix_length = key_states.shape[1] - suffix_length
+            att_output = self._attend_with_detached_tactile_prefix(
+                attention_mask_,
+                batch_size,
+                head_dim,
+                query_states,
+                key_states,
+                value_states,
+                _attention_bias,
+                query_states.shape[1] - suffix_length + tactile_token_index,
+                tactile_token_count,
+                torch.cat([key_states[:, :prefix_length].detach(), key_states[:, prefix_length:]], dim=1),
+                torch.cat([value_states[:, :prefix_length].detach(), value_states[:, prefix_length:]], dim=1),
+            )
+        else:
+            att_output = self.get_attention_interface()(
+                attention_mask_, batch_size, head_dim, query_states, key_states, value_states, _attention_bias
+            )
         return [att_output], past_key_values
 
     def forward_cross_attn_layer(
@@ -732,15 +792,42 @@ class SmolVLMWithExpertModel(nn.Module):
                 )
             expert_query_states = apply_rope(expert_query_state, expert_position_id)
 
-            att_output = attention_interface(
-                expert_attention_mask,
-                batch_size,
-                head_dim,
-                expert_query_states,
-                expert_key_states,
-                expert_value_states,
-                expert_attention_bias,
-            )
+            if (
+                self.fm_tactile_stop_gradient_to_vlm
+                and torch.is_grad_enabled()
+                and tactile_token_index is not None
+                and (_key_states.requires_grad or _value_states.requires_grad)
+            ):
+                # The expert's K/V projections still learn from the tactile rows.
+                tactile_prefix_keys = expert_layer.self_attn.k_proj(_key_states.detach()).reshape_as(
+                    expert_key_states[:, :prefix_key_count]
+                )
+                tactile_prefix_values = expert_layer.self_attn.v_proj(_value_states.detach()).reshape_as(
+                    expert_value_states[:, :prefix_key_count]
+                )
+                att_output = self._attend_with_detached_tactile_prefix(
+                    expert_attention_mask,
+                    batch_size,
+                    head_dim,
+                    expert_query_states,
+                    expert_key_states,
+                    expert_value_states,
+                    expert_attention_bias,
+                    tactile_token_index,
+                    tactile_token_count,
+                    torch.cat([tactile_prefix_keys, expert_key_states[:, prefix_key_count:]], dim=1),
+                    torch.cat([tactile_prefix_values, expert_value_states[:, prefix_key_count:]], dim=1),
+                )
+            else:
+                att_output = attention_interface(
+                    expert_attention_mask,
+                    batch_size,
+                    head_dim,
+                    expert_query_states,
+                    expert_key_states,
+                    expert_value_states,
+                    expert_attention_bias,
+                )
             att_outputs.append(att_output)
         else:
             att_outputs.append(None)

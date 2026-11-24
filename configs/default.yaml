@@ -96,11 +96,17 @@ policy:
   observation_delay_zero_bypass: false  # Zero path: d=0 keeps original norms and residual gate=1.
   use_observation_delay_token: false
   use_tactile: false
-  use_tactile_delta: false  # Raw current-baseline displacement; bypass absolute-coordinate normalization.
+  tactile_normalization: legacy  # image_size scales marker x/y by 320/240 before encoding.
+  use_tactile_delta: false  # Subtract baseline after tactile preprocessing.
   use_tactile_finger_tokens: false  # Separate left/right tokens; learned finger IDs 0/1 per branch.
   use_tactile_adarms: false  # AdaLN-Zero: per-layer RMSNorm scale/shift + zero residual gates.
   use_tactile_hmm: false  # Use the K=8 state from dataset meta/hmm.json for tactile AdaLN-Zero.
   use_fm_tactile_token: false
+  use_fm_tactile_summary_token: false  # Append one learned readout to the FM tactile history.
+  fm_tactile_summary_only: true  # FM tactile receivers see S only; false exposes history and S.
+  use_fm_tactile_summary_aux_loss: false  # Enable the S-to-future-tactile prediction loss.
+  fm_tactile_summary_aux_weight: 0.0  # MLP prediction at tactile offsets 0, 5, 10, 15.
+  fm_tactile_stop_gradient_to_vlm: false  # Detach prefix K/V for FM tactile queries only.
   use_tactile_ca0: true  # Legacy CA0 isolation by default; false routes FM tactile to the first chunk.
   use_vlm_tactile_token: false  # Independent 720-wide tactile MLP/TCN + projector in VLM prefix.
   vlm_tactile_reads_state: false  # Allow VLM tactile queries to read state tokens.
