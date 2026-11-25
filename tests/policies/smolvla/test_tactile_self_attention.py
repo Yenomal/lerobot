@@ -18,8 +18,9 @@ make_model = test_delay_adarms.make_model
 @pytest.mark.parametrize("ca0", [False, True])
 @pytest.mark.parametrize("fingers", [False, True])
 @pytest.mark.parametrize("amp", [False, True])
+@pytest.mark.parametrize("all_actions", [False, True])
 def test_self_cross_paths_masks_outputs_gradients_and_cached_parity(
-    make_model, self_reads, cross_reads, ca0, fingers, amp
+    make_model, self_reads, cross_reads, ca0, fingers, amp, all_actions
 ):
     torch.manual_seed(67)
     template = make_model(
@@ -30,6 +31,7 @@ def test_self_cross_paths_masks_outputs_gradients_and_cached_parity(
             template.config,
             use_tactile_self_attention=self_reads,
             use_tactile_ca0=ca0,
+            fm_tactile_all_actions=all_actions,
             use_tactile_finger_tokens=fingers,
             use_tactile_causal_attention=True,
             fm_tactile_token_history_length=3,
@@ -70,9 +72,12 @@ def test_self_cross_paths_masks_outputs_gradients_and_cached_parity(
         raw, copy = predict(data)
         tactile_count = 6 if fingers else 3
         receiver = tactile_count  # CA0 or A0.
+        receiver_count = actions.shape[1] + int(ca0) if all_actions else (1 if ca0 else 2)
+        receiver_end = receiver + receiver_count
         self_mask = captures[0][0]
-        assert self_mask[:, receiver, prefix_len : prefix_len + tactile_count].all().item() == self_reads
-        assert not self_mask[:, receiver + (1 if ca0 else 2) :, prefix_len : prefix_len + tactile_count].any()
+        self_tactile = self_mask[:, :, prefix_len : prefix_len + tactile_count]
+        assert (self_tactile[:, receiver:receiver_end] == self_reads).all()
+        assert not self_tactile[:, receiver_end:].any()
         times = torch.arange(tactile_count) // (2 if fingers else 1)
         expected_internal = times[:, None] >= times[None]
         torch.testing.assert_close(
@@ -82,13 +87,17 @@ def test_self_cross_paths_masks_outputs_gradients_and_cached_parity(
         cross_mask, cross_keys = captures[1]
         assert cross_keys == prefix_len + (tactile_count if cross_reads else 0)
         if cross_reads:
-            assert cross_mask[:, receiver, prefix_len:].all()
+            assert cross_mask[:, receiver:receiver_end, prefix_len:].all()
+            assert not cross_mask[:, receiver_end:, prefix_len:].any()
         if ca0:
-            assert not self_mask[:, receiver + 1 :, prefix_len : prefix_len + tactile_count].any()
+            assert not self_mask[:, receiver + 1 :, prefix_len + receiver].any()
+            assert not self_mask[:, receiver, prefix_len + receiver + 1].any()
         changed_raw, changed_copy = predict({key: value * -10 for key, value in data.items()})
         first, changed_first = (copy, changed_copy) if ca0 else (raw[:, 0], changed_raw[:, 0])
         if self_reads or cross_reads:
             assert not torch.allclose(first, changed_first)
+            if all_actions:
+                assert not torch.allclose(raw[:, -1], changed_raw[:, -1])
         else:
             torch.testing.assert_close(first, changed_first, rtol=0, atol=0)
         loss = model([], [], lang, valid, state, actions, noise, time, tactile_batch=data)

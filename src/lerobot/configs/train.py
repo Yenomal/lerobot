@@ -163,6 +163,8 @@ class TrainPipelineConfig(HubMixin):
     # when appropriate, or set it to `null` to use Python's platform default.
     dataloader_multiprocessing_context: str | None = "spawn"
     steps: int = 100_000
+    # Step budget passed to the LR scheduler. Uses `steps` by default; both count training microbatches.
+    scheduler_steps: int | None = field(default=None, kw_only=True)
     # Run policy in the simulation environment every N steps to measure reward/success (0 = disabled).
     env_eval_freq: int = 20_000
     log_freq: int = 200  # 0 or negative disables periodic logging
@@ -288,6 +290,9 @@ class TrainPipelineConfig(HubMixin):
         # `base_model`); the resumed weights and processors load from `checkpoint_path`.
 
     def validate(self) -> None:
+        if self.scheduler_steps is not None and self.scheduler_steps <= 0:
+            raise ValueError("`scheduler_steps` must be positive when set.")
+
         available_contexts = multiprocessing.get_all_start_methods()
         if (
             self.dataloader_multiprocessing_context is not None

@@ -16,6 +16,10 @@ import torch
 from packaging.version import Version
 from torch.optim.lr_scheduler import LambdaLR
 
+from lerobot.configs.default import DatasetConfig
+from lerobot.configs.train import TrainPipelineConfig
+from lerobot.optim.factory import make_optimizer_and_scheduler
+from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
     DiffuserSchedulerConfig,
@@ -95,6 +99,27 @@ def test_cosine_decay_with_warmup_scheduler(optimizer):
         expected_state_dict["_is_initial"] = False
 
     assert scheduler.state_dict() == expected_state_dict
+
+
+@pytest.mark.parametrize(("scheduler_steps", "expected_lr"), [(None, 1e-4), (8, 5.5e-4)])
+def test_scheduler_steps_override(scheduler_steps, expected_lr):
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(repo_id="lerobot/dummy"),
+        steps=4,
+        scheduler_steps=scheduler_steps,
+        use_policy_training_preset=False,
+        optimizer=AdamConfig(lr=1e-3),
+        scheduler=CosineDecayWithWarmupSchedulerConfig(
+            num_warmup_steps=2, num_decay_steps=8, peak_lr=1e-3, decay_lr=1e-4
+        ),
+    )
+    optimizer, scheduler = make_optimizer_and_scheduler(cfg, torch.nn.Linear(1, 1))
+    assert scheduler is not None
+    for _ in range(cfg.steps):
+        optimizer.step()
+        scheduler.step()
+
+    assert scheduler.get_last_lr() == pytest.approx([expected_lr])
 
 
 def test_warmup_stable_decay_scheduler(optimizer):

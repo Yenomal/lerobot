@@ -38,5 +38,6 @@ def make_optimizer_and_scheduler(
     if cfg.optimizer is None:
         raise ValueError("Optimizer config is required but not provided in TrainPipelineConfig")
     optimizer = cfg.optimizer.build(params)
-    lr_scheduler = cfg.scheduler.build(optimizer, cfg.steps) if cfg.scheduler is not None else None
+    scheduler_steps = cfg.steps if cfg.scheduler_steps is None else cfg.scheduler_steps
+    lr_scheduler = cfg.scheduler.build(optimizer, scheduler_steps) if cfg.scheduler is not None else None
     return optimizer, lr_scheduler

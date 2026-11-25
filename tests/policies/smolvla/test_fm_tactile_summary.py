@@ -45,7 +45,8 @@ def test_summary_aux_switch_controls_future_labels_independently_of_weight():
 @pytest.mark.parametrize("ca0", [False, True])
 @pytest.mark.parametrize("summary_only", [False, True])
 @pytest.mark.parametrize("cached", [False, True])
-def test_summary_mask(ca0, summary_only, cached):
+@pytest.mark.parametrize("all_actions", [False, True])
+def test_summary_mask(ca0, summary_only, cached, all_actions):
     prefix, delay, history, actions = 4, 1, 4, 4
     start = prefix + delay
     summary = start + history
@@ -65,6 +66,7 @@ def test_summary_mask(ca0, summary_only, cached):
         use_ca0=ca0,
         has_summary=True,
         summary_only=summary_only,
+        all_actions=all_actions,
     )[0]
     assert mask[summary - offset, :prefix].all()
     assert mask[summary - offset, start : summary + 1].all()
@@ -73,7 +75,8 @@ def test_summary_mask(ca0, summary_only, cached):
     assert not mask[start - offset : summary - offset, summary].any()
     assert mask[start - offset, start : start + 2].all()
     assert not mask[start - offset, start + 2 : summary].any()
-    receiver = slice(summary + 1 - offset, first_action + (0 if ca0 else 2) - offset)
+    end = length if all_actions else first_action + (0 if ca0 else 2)
+    receiver = slice(summary + 1 - offset, end - offset)
     assert mask[receiver, summary].all()
     assert (mask[receiver, start:summary] == (not summary_only)).all()
     assert not mask[receiver.stop :, start : summary + 1].any()

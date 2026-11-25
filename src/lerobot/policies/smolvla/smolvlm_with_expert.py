@@ -769,8 +769,7 @@ class SmolVLMWithExpertModel(nn.Module):
                 tactile_key = apply_rope(tactile_key, expert_position_id[:, tactile_token_index:tactile_end])
                 expert_key_states = torch.cat([expert_key_states, tactile_key], dim=1)
                 expert_value_states = torch.cat([expert_value_states, tactile_value], dim=1)
-                # Reuse the suffix block mask, including causal T-to-T edges.
-                # CA0 or first-chunk actions read the block according to this mask.
+                # Reuse the suffix mask for tactile history and action receivers.
                 tactile_visible = attention_mask[
                     :,
                     -expert_hidden_states.shape[1] :,

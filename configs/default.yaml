@@ -102,6 +102,7 @@ policy:
   use_tactile_adarms: false  # AdaLN-Zero: per-layer RMSNorm scale/shift + zero residual gates.
   use_tactile_hmm: false  # Use the K=8 state from dataset meta/hmm.json for tactile AdaLN-Zero.
   use_fm_tactile_token: false
+  fm_tactile_all_actions: false  # Let every action in the horizon read FM tactile K/V.
   use_fm_tactile_summary_token: false  # Append one learned readout to the FM tactile history.
   fm_tactile_summary_only: true  # FM tactile receivers see S only; false exposes history and S.
   use_fm_tactile_summary_aux_loss: false  # Enable the S-to-future-tactile prediction loss.
@@ -114,7 +115,7 @@ policy:
   vlm_context_reads_tactile: true  # Master permission for non-tactile VLM queries to read tactile.
   fm_tactile_reads_vlm_tactile: true  # Allow FM tactile queries to read VLM tactile K/V.
   use_tactile_cross_attention: false  # CA0 and the tactile block read live FM tactile K/V.
-  use_tactile_self_attention: true  # CA0/first-chunk action reads FM tactile in self-attention layers.
+  use_tactile_self_attention: true  # Tactile receivers read FM tactile in self-attention layers.
   use_tactile_cfg_gate: false
   use_tactile_reconstruction: false  # Frozen encoder/TCN output -> MLP -> current normalized tactile markers.
   tactile_reconstruction_hidden_dim: 256
@@ -144,6 +145,7 @@ prefetch_factor: 4
 persistent_workers: true
 dataloader_multiprocessing_context: spawn
 steps: 100000
+scheduler_steps: null  # Use steps as the LR scheduler's step budget unless overridden.
 env_eval_freq: 20000
 log_freq: 200
 eval_steps: 0

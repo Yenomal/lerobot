@@ -18,7 +18,8 @@ make_model = test_delay_adarms.make_model
 @pytest.mark.parametrize("cached", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("delay", [0, 1, 10])
-def test_first_five_actions_read_fm_tactile_and_not_vlm_tactile(cached, causal, delay):
+@pytest.mark.parametrize("all_actions", [False, True])
+def test_action_fm_tactile_scope_preserves_vlm_prefix_mask(cached, causal, delay, all_actions):
     prefix, tactile, horizon = 8, 3, 10
     length = prefix + delay + tactile + horizon
     pad = torch.ones(2, length, dtype=torch.bool)
@@ -41,11 +42,12 @@ def test_first_five_actions_read_fm_tactile_and_not_vlm_tactile(cached, causal, 
         use_ca0=False,
         tactile_action_count=5,
         prefix_tactile_mask=vlm_keys,
+        all_actions=all_actions,
     )
     t_start, action = prefix + delay, prefix + delay + tactile
     q_action = action - offset
     assert actual[:, q_action : q_action + 5, t_start:action].all()
-    assert not actual[:, q_action + 5 :, t_start:action].any()
+    assert (actual[:, q_action + 5 :, t_start:action] == all_actions).all()
     assert not actual[:, q_action : q_action + 5, 5:prefix].any()
     torch.testing.assert_close(actual[:, q_action + 5 :, :prefix], original[:, q_action + 5 :, :prefix])
     torch.testing.assert_close(actual[:, q_action:, action:], original[:, q_action:, action:])
@@ -158,15 +160,23 @@ def test_layout_conditions_masks_loss_and_cached_parity(
 
 def test_ca0_config_default_validation_and_round_trip(tmp_path):
     assert SmolVLAConfig().use_tactile_ca0
-    config = SmolVLAConfig(use_tactile=True, use_fm_tactile_token=True, use_tactile_ca0=True)
+    assert not SmolVLAConfig().fm_tactile_all_actions
+    config = SmolVLAConfig(
+        use_tactile=True, use_fm_tactile_token=True, use_tactile_ca0=True, fm_tactile_all_actions=True
+    )
     config.save_pretrained(tmp_path)
-    assert SmolVLAConfig.from_pretrained(tmp_path).use_tactile_ca0
-    # Old checkpoints predate the toggle and must retain their CA0 layout.
+    loaded = SmolVLAConfig.from_pretrained(tmp_path)
+    assert loaded.use_tactile_ca0
+    assert loaded.fm_tactile_all_actions
+    # Checkpoints that predate the toggles use the default CA0-only routing.
     path = tmp_path / "config.json"
     saved = json.loads(path.read_text())
     del saved["use_tactile_ca0"]
+    del saved["fm_tactile_all_actions"]
     path.write_text(json.dumps(saved))
-    assert SmolVLAConfig.from_pretrained(tmp_path).use_tactile_ca0
+    loaded = SmolVLAConfig.from_pretrained(tmp_path)
+    assert loaded.use_tactile_ca0
+    assert not loaded.fm_tactile_all_actions
     replace(config, use_tactile_ca0=False).save_pretrained(tmp_path)
     assert not SmolVLAConfig.from_pretrained(tmp_path).use_tactile_ca0
     with pytest.raises(ValueError, match="use_tactile_cfg_gate requires use_tactile_ca0"):

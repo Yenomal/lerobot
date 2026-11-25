@@ -1787,8 +1787,9 @@ class VLAFlowMatching(nn.Module):
         prefix_tactile_mask: Tensor | None = None,
         has_summary: bool = False,
         summary_only: bool = True,
+        all_actions: bool = False,
     ) -> Tensor:
-        """Route live FM tactile to isolated CA0 or the first execution chunk."""
+        """Route live FM tactile to CA0, the first chunk, or the full action horizon."""
         if action_count < 1 or tactile_token_count < 1:
             raise ValueError("tactile token masking requires at least one action and tactile token")
         special_offset = int(delay_token)
@@ -1836,7 +1837,7 @@ class VLAFlowMatching(nn.Module):
         readable_tactile_start = history_end if has_summary and summary_only else tactile_index
 
         # CA0 inherits A0's prefix, delay and other-action visibility. Replace
-        # the A0 self key with its own key so the two branches cannot interact.
+        # the A0 self key with its own key to keep the pair mutually masked.
         if use_ca0:
             masked[:, copy_query_index, :] = action0_context
             masked[:, copy_query_index, action0_index] = False
@@ -1847,6 +1848,9 @@ class VLAFlowMatching(nn.Module):
             masked[:, heads, readable_tactile_start:copy_action_index] = True
             if prefix_tactile_mask is not None:
                 masked[:, heads, :prefix_len] &= ~prefix_tactile_mask[:, None, :]
+        if all_actions:
+            actions = slice(action0_query_index, action0_query_index + action_count)
+            masked[:, actions, readable_tactile_start:copy_action_index] = True
         return masked
 
     @staticmethod
@@ -2152,8 +2156,8 @@ class VLAFlowMatching(nn.Module):
             action_time_emb = action_time_emb + delay_embedding.to(action_time_emb.dtype)
 
         # The tactile suffix is ``T0..T(H-1), [S], [CA0], A0, A1, ...``. CA0 is a
-        # copy of A0 with the same noisy input and timestep condition, but its
-        # attention row is isolated so only CA0 consumes tactile context.
+        # copy of A0 with the same noisy input and timestep condition. Its
+        # attention row is configured alongside the other tactile receivers.
         use_fm_tactile_token = tactile_embedding is not None and self.config.use_fm_tactile_token
         use_delay_token = self.observation_delay_token_embedding is not None
         action_tokens = action_time_emb
@@ -2449,6 +2453,7 @@ class VLAFlowMatching(nn.Module):
                 prefix_tactile_mask=prefix_att_masks == 2,
                 has_summary=has_summary,
                 summary_only=getattr(self.config, "fm_tactile_summary_only", True),
+                all_actions=getattr(self.config, "fm_tactile_all_actions", False),
             )
         attention_bias = None
         if self.training and self.config.streaming and self.config.streaming_attention_mode == "random_gate":
@@ -3186,6 +3191,7 @@ class VLAFlowMatching(nn.Module):
                 prefix_tactile_mask=self._prefix_tactile_keys(prefix_pad_masks),
                 has_summary=has_summary,
                 summary_only=getattr(self.config, "fm_tactile_summary_only", True),
+                all_actions=getattr(self.config, "fm_tactile_all_actions", False),
             )
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         prefix_tactile_count = self._prefix_tactile_keys(prefix_pad_masks).sum(-1, keepdim=True)

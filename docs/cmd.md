@@ -78,7 +78,8 @@ VLM 的旧 prepared batch 不再发送给 FM，FM 始终对当前 observation �
   `v(A0)`；其它 chunk head 保持 `stream-head-mean` 逻辑。
 
 三个 tactile 模式要求 `use_fm_tactile_token=true`、`use_tactile_ca0=true`，且每次 FM 推理提供 tactile observation。
-关闭 CA0 时使用 `stream` / `stream-head` / `stream-head-mean` 等普通模式，首个执行 chunk 直接读取 FM 触觉。
+关闭 CA0 时使用 `stream` / `stream-head` / `stream-head-mean` 等普通模式。Runtime 从 checkpoint
+读取 `fm_tactile_all_actions`，决定 FM 触觉是提供给默认接收分支还是整个 action horizon。
 临时消融实验参数 `--exp-random-tactile`（默认关闭）支持 local/process Runtime，要求 SmolVLA
 开启 tactile token。开启后在预处理完成的触觉空间，用独立的 `N(0,1)` 随机值替代左右触觉输入，
 每次新观测刷新，history 随随机帧维护，同次 denoising 复用；VLM prefix 不随机化。
@@ -264,6 +265,7 @@ policy:
   use_tactile_finger_tokens: false  # Separate finger tokens, learned left=0/right=1 embeddings.
   use_tactile_adarms: false  # AdaLN-Zero: per-layer RMSNorm scale/shift + zero residual gates.
   use_fm_tactile_token: false
+  fm_tactile_all_actions: false
   use_fm_tactile_summary_token: false
   fm_tactile_summary_only: true
   use_fm_tactile_summary_aux_loss: false
@@ -315,7 +317,7 @@ policy:
 `use_tactile_cross_attention` 默认 `false`，要求 `attention_mode: cross_attn`。
 
 `use_tactile_self_attention` 默认 `true`，独立控制 self-attention 层中 action 接收分支
-读取 FM 触觉 K/V：CA0 开启时控制 CA0，关闭时控制首个执行 chunk 的 action。
+读取 FM 触觉 K/V。接收范围由 `fm_tactile_all_actions` 和 `use_tactile_ca0` 决定。
 设为 `false` 只移除这些 self-attention 读取边，不改变触觉内部双向/因果 mask、触觉读取 prefix、
 action–action attention 或 VLM 侧触觉规则；cross-attention 使用自己的开关和原始路由 mask，
 不会因为关闭 self 路径而同时失效。旧 checkpoint 缺少新字段时保留 `true`。
@@ -332,10 +334,8 @@ action–action attention 或 VLM 侧触觉规则；cross-attention 使用自己
 即使两条 attention 读取路径都关闭，action 仍可通过触觉 AdaLN 调制接收信息。
 
 开启后，FM cross-attention 的 K/V 为「缓存的 VLM prefix + 当前 FM tactile block 的独立 K/V 投影」。
-每层投影整个 tactile block 的 hidden states，CA0 模式下 `CA0` 读取整个 block，
-无 CA0 模式下首个执行 chunk 的 action 读取 block。触觉 query 按 block 内的双向/因果 mask 可见；
-其余 action、delay query 仍只读 prefix。self-attention 采用相同的接收分支规则。
-CA0 模式下普通动作不能读取 `CA0`，防止经该分支间接接收 FM 触觉。
+每层投影整个 tactile block 的 hidden states。触觉 query 按 block 内的双向或因果 mask 读取，
+动作接收分支遵循同一套 FM 触觉路由，其余 action 和 delay query 在 cross-attention 层只读 prefix。
 触觉只随 FM 请求刷新，不加入 VLM token 或复用的 prefix KV cache，无需重跑 VLM。
 这条路径需要训练新增 K/V 投影（PEFT 下也会完整保存、训练），不增加 FM 前向次数。
 CA0 模式的 `CA0-A0` 保留额外 FM 触觉路径的对照。要让普通动作不经独立触觉调制接收触觉，还需保持
@@ -471,6 +471,7 @@ batch 含有 observation history，policy 会选择对应的历史帧。tactile 
 开启 `use_fm_tactile_token` 后，触觉不会写入 VLM prefix cache，而是在每次新的 FM inference
 调用开始时重新编码，并贯穿该次 denoising。触觉 MLP 为 `504 → 720 → 720`（UniVTAC 默认配置），
 隐藏层和输出层均跟随 FM expert hidden size，不再包含 `tactile_token_proj`。
+`fm_tactile_all_actions=false` 时，沿用下述默认路由。
 设置 `use_tactile_ca0=true` 时，FM suffix 使用 `T0, ..., T(H-1), CA0, A0, A1, ...` 布局：`CA0` 复制 `A0` 的 noisy
 action 输入和位置条件。self-attention 中，`CA0` 与 `A0` 读取相同的其他 action token
 （遵循 streaming attention mask），各自可以读取自己，但互不可见；只有 `CA0` 动作分支可以读取触觉 block。
@@ -490,10 +491,14 @@ attention 间接获得 FM 触觉。现有 action–action mask 保持不变。
 `use_tactile_cfg_gate` 和三个 `stream-head-*-tactile*` 模式依赖 CA0，关闭时会明确报错。
 旧 checkpoint 缺少 `use_tactile_ca0` 字段时默认使用 `true`；已保存的显式 `false` 仍保持无 CA0 模式。
 
+`fm_tactile_all_actions=true` 让整个 horizon 的普通 action 直接读取 FM 触觉。
+同时开启 `use_tactile_ca0` 时，CA0 也读取 FM 触觉，CA0/A0 诊断会比较两个都带 FM 触觉的分支。
+训练与缓存推理都应用这个范围。VLM 触觉的可见性和 action–action attention 仍由各自的 mask 决定。
+
 `use_fm_tactile_summary_token=true` 在 FM 触觉历史和 CA0/action 之间追加一个可学习的
 汇总 token `S`。它读取整个触觉 block，沿用 FM 触觉读取 VLM prefix 的规则，
 与最新触觉帧共用 RoPE 位置。历史触觉不能读取 `S`。开启
-`fm_tactile_summary_only` 时，CA0 或首个执行 chunk 只从 `S` 获取 FM 触觉，
+`fm_tactile_summary_only` 时，有权读取 FM 触觉的动作只从 `S` 获取 FM 触觉，
 要求关闭 `use_tactile_adarms`。设为 `false` 时动作可同时读 `S` 和触觉历史。
 两种模式均沿用 FM 的 self/cross-attention 开关。
 

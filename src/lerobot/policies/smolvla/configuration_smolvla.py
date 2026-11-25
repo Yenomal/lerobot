@@ -88,6 +88,8 @@ class SmolVLAConfig(PreTrainedConfig):
     # Populated from dataset meta/hmm.json and saved with the policy for inference.
     tactile_hmm_metadata: dict[str, Any] | None = field(default=None, repr=False)
     use_fm_tactile_token: bool = False
+    # Also expose FM tactile K/V to every real action in the horizon.
+    fm_tactile_all_actions: bool = False
     use_fm_tactile_summary_token: bool = False
     # Action receivers read S only, or both the history tokens and S.
     fm_tactile_summary_only: bool = True
@@ -95,7 +97,7 @@ class SmolVLAConfig(PreTrainedConfig):
     fm_tactile_summary_aux_weight: float = 0.0
     # Stop prefix K/V gradients from FM tactile queries while retaining their values.
     fm_tactile_stop_gradient_to_vlm: bool = False
-    # True: isolated CA0 branch. False: first execution chunk reads live FM tactile.
+    # Include the separate CA0 action copy. By default, CA0 is the sole tactile receiver.
     use_tactile_ca0: bool = True
     # Independent tactile encoder in the VLM prefix, appended after state.
     use_vlm_tactile_token: bool = False
@@ -107,7 +109,7 @@ class SmolVLAConfig(PreTrainedConfig):
     vlm_context_reads_tactile: bool = True
     # FM tactile queries may read VLM tactile K/V, independently of other prefix context.
     fm_tactile_reads_vlm_tactile: bool = True
-    # CA0 or first-chunk actions read live FM tactile K/V in cross-attention layers.
+    # Action receivers read live FM tactile K/V in cross-attention layers.
     use_tactile_cross_attention: bool = False
     # Action receivers read live FM tactile K/V in self-attention layers.
     use_tactile_self_attention: bool = True
