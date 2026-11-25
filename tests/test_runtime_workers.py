@@ -33,6 +33,8 @@ def test_process_proxy_and_fm_worker_forward_tactile_guidance_and_delay(
     sent = []
     actions = np.zeros((2, 3), dtype=np.float32)
     proxy = ProcessStreamingRunner.__new__(ProcessStreamingRunner)
+    proxy._fm_lock = Lock()
+    proxy._session_id = "robot-a"
     proxy._fm_prefix_cache = None
     proxy._fm_prefix_id = None
     proxy._fm_parent = SimpleNamespace(send=sent.append, recv=lambda: {"actions": actions})
@@ -57,7 +59,7 @@ def test_process_proxy_and_fm_worker_forward_tactile_guidance_and_delay(
 
     def load_runner(*args, **kwargs):
         load_options.update(kwargs)
-        return runner
+        return SimpleNamespace(for_session=lambda session_id: runner)
 
     monkeypatch.setattr("lerobot.runtime_workers.load_runtime_runner", load_runner)
     requests = iter([sent[0], {"op": "close"}])
@@ -74,6 +76,8 @@ def test_process_proxy_and_fm_worker_forward_tactile_guidance_and_delay(
 def test_proxy_submits_prefix_once_until_refresh_or_reset():
     sent = []
     proxy = ProcessStreamingRunner.__new__(ProcessStreamingRunner)
+    proxy._fm_lock = Lock()
+    proxy._session_id = "robot-a"
     proxy._vlm_lock = Lock()
     proxy._fm_prefix_cache = None
     proxy._fm_prefix_id = None
@@ -147,12 +151,16 @@ def test_fm_worker_reuses_and_replaces_device_cache_and_clears_it_on_reset(monke
         return SimpleNamespace(canonical_actions=observed[-1].reshape(2, 2))
 
     runner = SimpleNamespace(predict_from_prefix=predict, reset=lambda **kwargs: resets.append(True))
-    monkeypatch.setattr("lerobot.runtime_workers.load_runtime_runner", lambda *args: runner)
+    monkeypatch.setattr(
+        "lerobot.runtime_workers.load_runtime_runner",
+        lambda *args: SimpleNamespace(for_session=lambda session_id: runner),
+    )
     first, second = payload(1.0), payload(2.0)
 
     def request(cache_id, cache=None):
         result = {
             "op": "predict_from_prefix",
+            "session_id": "robot-a",
             "cache_id": cache_id,
             "features": {},
             "task": "task",
@@ -171,7 +179,7 @@ def test_fm_worker_reuses_and_replaces_device_cache_and_clears_it_on_reset(monke
             request("first"),
             request("second", second),
             request("second"),
-            {"op": "reset"},
+            {"op": "reset", "session_id": "robot-a"},
             request("third", first),
             {"op": "close"},
         ]
@@ -193,9 +201,13 @@ def test_fm_worker_rejects_cache_reference_without_matching_loaded_prefix(monkey
         reset=lambda **kwargs: None,
         predict_from_prefix=lambda *args, **kwargs: SimpleNamespace(canonical_actions=torch.zeros(1, 1)),
     )
-    monkeypatch.setattr("lerobot.runtime_workers.load_runtime_runner", lambda *args: runner)
+    monkeypatch.setattr(
+        "lerobot.runtime_workers.load_runtime_runner",
+        lambda *args: SimpleNamespace(for_session=lambda session_id: runner),
+    )
     initial = {
         "op": "predict_from_prefix",
+        "session_id": "robot-a",
         "cache_id": "loaded",
         "cache": {},
         "features": {},
@@ -207,14 +219,81 @@ def test_fm_worker_rejects_cache_reference_without_matching_loaded_prefix(monkey
     }
     requests = iter(
         ([initial] if scenario != "missing" else [])
-        + ([{"op": "reset"}] if scenario == "reset" else [])
-        + [{"op": "predict_from_prefix", "cache_id": "loaded" if scenario == "reset" else "missing"}]
+        + ([{"op": "reset", "session_id": "robot-a"}] if scenario == "reset" else [])
+        + [
+            {key: value for key, value in initial.items() if key != "cache"}
+            | {"cache_id": "loaded" if scenario == "reset" else "missing"},
+            {"op": "close"},
+        ]
     )
     replies = []
     connection = SimpleNamespace(send=replies.append, recv=lambda: next(requests), close=lambda: None)
-    with pytest.raises(ValueError, match="FM prefix cache is not loaded"):
-        _worker_main("fm", "checkpoint", "cpu", connection)
-    assert "error" in replies[-1]
+    _worker_main("fm", "checkpoint", "cpu", connection)
+    assert "FM prefix cache is not loaded" in replies[-2]["error"]
+    assert replies[-1] == {"ok": True}
+
+
+def test_interleaved_fm_sessions_keep_their_window_and_prefix(monkeypatch):
+    class SessionRunner:
+        def __init__(self):
+            self.step = 0
+
+        def predict_from_prefix(self, prepared, cache, **kwargs):
+            self.step += 1
+            return SimpleNamespace(canonical_actions=torch.tensor([[cache["value"], self.step]]))
+
+        def reset(self, *, full):
+            self.step = 0
+
+    monkeypatch.setattr(
+        "lerobot.runtime_workers.load_runtime_runner",
+        lambda *args: SimpleNamespace(for_session=lambda session_id: SessionRunner()),
+    )
+
+    def predict(session_id, cache_id, value=None):
+        request = {
+            "op": "predict_from_prefix",
+            "session_id": session_id,
+            "cache_id": cache_id,
+            "features": {},
+            "task": "task",
+            "sequence": 0,
+            "inference_mode": "stream-head",
+            "context_cfg_lambda": 0.1,
+            "tactile_cfg_lambda": 1.5,
+        }
+        if value is not None:
+            request["cache"] = {"value": value}
+        return request
+
+    requests = iter(
+        [
+            predict("a", "a-first", 10),
+            predict("b", "b-first", 20),
+            predict("a", "a-refreshed", 11),
+            {"op": "reset", "session_id": "a"},
+            predict("a", "a-refreshed"),
+            predict("b", "b-first"),
+            predict("a", "a-new", 12),
+            {"op": "release", "session_id": "a"},
+            predict("b", "b-first"),
+            predict("a", "a-reconnected", 13),
+            {"op": "close"},
+        ]
+    )
+    replies = []
+    connection = SimpleNamespace(send=replies.append, recv=lambda: next(requests), close=lambda: None)
+    _worker_main("fm", "checkpoint", "cpu", connection)
+    assert [reply["actions"].tolist()[0] for reply in replies if "actions" in reply] == [
+        [10, 1],
+        [20, 1],
+        [11, 2],
+        [20, 2],
+        [12, 1],
+        [20, 3],
+        [13, 1],
+    ]
+    assert "FM prefix cache is not loaded" in replies[5]["error"]
 
 
 def test_reset_serializes_with_pending_vlm_refresh(monkeypatch):
@@ -222,6 +301,8 @@ def test_reset_serializes_with_pending_vlm_refresh(monkeypatch):
     from threading import Event
 
     proxy = ProcessStreamingRunner.__new__(ProcessStreamingRunner)
+    proxy._fm_lock = Lock()
+    proxy._session_id = "robot-a"
     proxy._vlm_lock = Lock()
     proxy._fm_prefix_id = "old"
     proxy._fm_prefix_cache = {}

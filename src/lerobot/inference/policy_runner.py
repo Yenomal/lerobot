@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import inspect
 import time
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import replace
 from typing import Any
 
@@ -76,6 +76,7 @@ class PolicyRunner:
         """Validate a deployment and own its canonical processor pairs."""
         self.policy = policy
         self.preprocessor = preprocessor
+        self._prefix_preprocessor: PolicyProcessorPipeline | None = None
         self.postprocessor = postprocessor
         self.robot_type = robot_type
         self.max_text_input = max_text_input
@@ -253,8 +254,11 @@ class PolicyRunner:
             batch[TACTILE_HMM_STATE] = torch.tensor([observation.tactile_hmm_state], dtype=torch.long)
         return batch
 
-    def _prepare_observation(self, observation: ObservationSnapshot) -> dict[str, Any]:
-        prepared = self.preprocessor(self._batch(observation))
+    def _prepare_observation(
+        self, observation: ObservationSnapshot, preprocessor: PolicyProcessorPipeline | None = None
+    ) -> dict[str, Any]:
+        processor = self.preprocessor if preprocessor is None else preprocessor
+        prepared = processor(self._batch(observation))
         if observation.tactile_history is not None:
             prepared["_runtime_tactile_history"] = True
         return prepared
@@ -291,7 +295,7 @@ class PolicyRunner:
         encoder = getattr(self.policy, "encode_prefix", None)
         if not callable(encoder):
             raise ValueError("The loaded policy does not expose split prefix encoding.")
-        prepared = self._prepare_observation(observation)
+        prepared = self._prepare_observation(observation, self._prefix_preprocessor)
         return prepared, encoder(prepared)
 
     def predict_from_prefix(
@@ -418,6 +422,35 @@ class PolicyRunner:
             raise ValueError("Text generation returned an empty, invalid, or oversized answer.")
         return answer.strip()
 
+    def for_session(self, _session_id: str) -> PolicyRunner:
+        """Give a Runtime session its own policy state and paired processors."""
+        fork_policy = getattr(self.policy, "fork_runtime_session", None)
+        if not callable(fork_policy):
+            shared_weights = {id(parameter): parameter for parameter in self.policy.parameters()}
+            runner = deepcopy(self, shared_weights)
+        else:
+            runner = copy(self)
+            runner.policy = fork_policy()
+            (
+                runner.preprocessor,
+                runner.postprocessor,
+                runner._relative_step,
+                runner._normalizer_step,
+                runner.language_processors,
+            ) = deepcopy(
+                (
+                    self.preprocessor,
+                    self.postprocessor,
+                    self._relative_step,
+                    self._normalizer_step,
+                    self.language_processors,
+                )
+            )
+        # Async prefix refresh must not change the FM postprocessor's action anchor.
+        if callable(getattr(runner.policy, "encode_prefix", None)):
+            runner._prefix_preprocessor = deepcopy(runner.preprocessor)
+        return runner
+
     def reset(self, *, full: bool = True) -> None:
         """Full run reset clears state; motion invalidation preserves planner memory."""
         if not full:
@@ -425,6 +458,8 @@ class PolicyRunner:
             return
         self.policy.reset()
         self.preprocessor.reset()
+        if self._prefix_preprocessor is not None:
+            self._prefix_preprocessor.reset()
         self.postprocessor.reset()
         if self.language_processors is not None:
             self.language_processors[0].reset()

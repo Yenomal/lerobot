@@ -147,6 +147,10 @@ client: CONTROL(op="ack", action_id)
 
 `features` 是字符串到 NumPy 数组的映射，例如图像和本体状态。server 收到观测后，如果动作队列非空就取队列头；队列为空才调用 policy 生成新的动作块。server 返回动作后会保留 pending action，直到收到对应 `ack`；确认丢失时重发观测会得到同一个动作，不会跳过队列项。
 
+多个 client 可以连接同一端口。首条请求的 `session_id` 绑定到当前 TCP 连接，每个 ID 同时允许一个连接。
+在 SmolVLA `process` 模式下，各会话共享同一对 VLM/FM worker 和模型权重，FM 分别保存每个会话的去噪窗口和 GPU prefix KV。
+同一 worker 串行处理请求。断连会释放对应会话的状态，使用同一 ID 重连时会创建新会话。
+
 reset 使用：
 
 ```text

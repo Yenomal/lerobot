@@ -47,6 +47,26 @@ def test_prepare_images_normalizes_uint8_inputs_before_resizing(resize):
         torch.testing.assert_close(images[0], image.float() / 255.0 * 2.0 - 1.0)
 
 
+def test_runtime_policy_fork_owns_streaming_state_and_shares_weights():
+    policy = object.__new__(SmolVLAPolicy)
+    torch.nn.Module.__init__(policy)
+    policy.config = SmolVLAConfig()
+    policy.model = object.__new__(VLAFlowMatching)
+    torch.nn.Module.__init__(policy.model)
+    policy.model.action_out_proj = torch.nn.Linear(2, 2)
+
+    first, second = policy.fork_runtime_session(), policy.fork_runtime_session()
+    assert first.model.action_out_proj.weight is second.model.action_out_proj.weight
+    assert first.model.action_out_proj.weight is policy.model.action_out_proj.weight
+    first.model._stream_state = {"action_window": torch.ones(2)}
+    second.model._stream_head_state = {"action_window": torch.ones(3)}
+    assert first.model._stream_head_state is None
+    assert second.model._stream_state is None
+    first.reset()
+    assert first.model._stream_state is None
+    assert second.model._stream_head_state["action_window"].numel() == 3
+
+
 def test_smolvla_dimensions_default_to_six_and_do_not_hide_feature_mismatch():
     config = SmolVLAConfig()
     assert config.state_dim == 6

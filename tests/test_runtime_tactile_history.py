@@ -131,6 +131,8 @@ def test_worker_transport_preserves_tactile_history_and_hmm_state(monkeypatch, r
     seen, requests = [], []
     proxy = ProcessStreamingRunner.__new__(ProcessStreamingRunner)
     proxy._vlm_lock = Lock()
+    proxy._fm_lock = Lock()
+    proxy._session_id = "robot-a"
     proxy._fm_prefix_id, proxy._fm_prefix_cache = None, None
     response = (
         {"prepared": {}, "cache": {}} if role == "vlm" else {"actions": np.zeros((1, 1), dtype=np.float32)}
@@ -163,7 +165,9 @@ def test_worker_transport_preserves_tactile_history_and_hmm_state(monkeypatch, r
 
     monkeypatch.setattr(
         "lerobot.runtime_workers.load_runtime_runner",
-        lambda *args, **kwargs: SimpleNamespace(encode_prefix=encode, predict_from_prefix=predict),
+        lambda *args, **kwargs: SimpleNamespace(
+            for_session=lambda session_id: SimpleNamespace(encode_prefix=encode, predict_from_prefix=predict)
+        ),
     )
     incoming = iter([requests[0], {"op": "close"}])
     _worker_main(

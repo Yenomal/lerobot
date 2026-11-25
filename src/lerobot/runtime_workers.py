@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import copy
 from multiprocessing.connection import Connection
 from threading import Lock
 from types import SimpleNamespace
@@ -13,7 +14,7 @@ import numpy as np
 import torch
 
 from lerobot.configs import PreTrainedConfig
-from lerobot.inference import ActionChunk, ActionProvenance, ObservationSnapshot
+from lerobot.inference import ActionChunk, ActionProvenance, ObservationSnapshot, PolicyRunner
 from lerobot.runtime_server import load_runtime_runner
 
 
@@ -90,76 +91,87 @@ def _decode_cache(value: Any, device: str) -> Any:
     return value
 
 
+def _worker_request(
+    role: str,
+    runner: PolicyRunner,
+    device: str,
+    sessions: dict[str, PolicyRunner],
+    fm_caches: dict[str, tuple[str, Any]],
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    session_id = request["session_id"]
+    op = request["op"]
+    if op in ("reset", "release"):
+        fm_caches.pop(session_id, None)
+        if op == "release":
+            sessions.pop(session_id, None)
+        elif session_id in sessions:
+            sessions[session_id].reset(full=True)
+        return {"ok": True}
+
+    session = sessions.get(session_id)
+    if session is None:
+        session = sessions[session_id] = runner.for_session(session_id)
+    observation = ObservationSnapshot(
+        request["features"],
+        request.get("capture_time", 0.0),
+        request["task"],
+        observation_id=str(request["sequence"]),
+        tactile_history=request.get("tactile_history"),
+        tactile_history_times=tuple(request.get("tactile_history_times", ())),
+        tactile_hmm_state=request.get("tactile_hmm_state"),
+    )
+    if role == "vlm" and op == "encode_prefix":
+        prepared, cache = session.encode_prefix(observation)
+        return {"prepared": _cpu_tree(prepared), "cache": _encode_cache(cache)}
+    if role == "fm" and op == "predict_from_prefix":
+        cache_id = request["cache_id"]
+        if "cache" in request:
+            fm_cache = _decode_cache(request["cache"], device)
+        else:
+            loaded = fm_caches.get(session_id)
+            if loaded is None or loaded[0] != cache_id:
+                raise ValueError("FM prefix cache is not loaded; submit the cache before reusing its ID")
+            _, fm_cache = loaded
+        result = session.predict_from_prefix(
+            {},
+            fm_cache,
+            observation=observation,
+            inference_mode=request["inference_mode"],
+            context_cfg_lambda=float(request["context_cfg_lambda"]),
+            tactile_cfg_lambda=float(request["tactile_cfg_lambda"]),
+            observation_delay_tokens=request.get("observation_delay_tokens"),
+            observation_delay_chunks=request.get("observation_delay_chunks"),
+        )
+        fm_caches[session_id] = (cache_id, fm_cache)
+        return {"actions": result.canonical_actions.cpu().numpy()}
+    raise ValueError(f"Unsupported {role} worker operation: {op!r}")
+
+
 def _worker_main(
     role: str, checkpoint: str, device: str, connection: Connection, exp_random_tactile: bool = False
 ) -> None:
     runner = load_runtime_runner(
         checkpoint, device, **({"exp_random_tactile": True} if exp_random_tactile else {})
     )
-    fm_cache_id: str | None = None
-    fm_cache: Any = None
+    sessions: dict[str, PolicyRunner] = {}
+    fm_caches: dict[str, tuple[str, Any]] = {}
     try:
         connection.send({"ready": role})
         while True:
             request = connection.recv()
-            op = request.get("op")
-            if op == "close":
+            if request["op"] == "close":
                 connection.send({"ok": True})
                 return
-            if op == "reset":
-                runner.reset(full=True)
-                fm_cache_id = None
-                fm_cache = None
-                connection.send({"ok": True})
-                continue
-            if role == "vlm" and op == "encode_prefix":
-                observation = ObservationSnapshot(
-                    request["features"],
-                    request.get("capture_time", 0.0),
-                    request["task"],
-                    observation_id=str(request["sequence"]),
-                    tactile_history=request.get("tactile_history"),
-                    tactile_history_times=tuple(request.get("tactile_history_times", ())),
-                    tactile_hmm_state=request.get("tactile_hmm_state"),
-                )
-                prepared, cache = runner.encode_prefix(observation)
-                connection.send({"prepared": _cpu_tree(prepared), "cache": _encode_cache(cache)})
-                continue
-            if role == "fm" and op == "predict_from_prefix":
-                cache_id = request["cache_id"]
-                if "cache" in request:
-                    fm_cache = _decode_cache(request["cache"], device)
-                    fm_cache_id = cache_id
-                elif fm_cache_id is None or cache_id != fm_cache_id:
-                    raise ValueError("FM prefix cache is not loaded; submit the cache before reusing its ID")
-                observation = ObservationSnapshot(
-                    request["features"],
-                    request.get("capture_time", 0.0),
-                    request["task"],
-                    observation_id=str(request["sequence"]),
-                    tactile_history=request.get("tactile_history"),
-                    tactile_history_times=tuple(request.get("tactile_history_times", ())),
-                    tactile_hmm_state=request.get("tactile_hmm_state"),
-                )
-                result = runner.predict_from_prefix(
-                    {},
-                    fm_cache,
-                    observation=observation,
-                    inference_mode=request["inference_mode"],
-                    context_cfg_lambda=float(request["context_cfg_lambda"]),
-                    tactile_cfg_lambda=float(request["tactile_cfg_lambda"]),
-                    observation_delay_tokens=request.get("observation_delay_tokens"),
-                    observation_delay_chunks=request.get("observation_delay_chunks"),
-                )
-                connection.send({"actions": result.canonical_actions.cpu().numpy()})
-                continue
-            raise ValueError(f"Unsupported {role} worker operation: {op!r}")
-    except BaseException as exc:
-        try:
-            connection.send({"error": f"{type(exc).__name__}: {exc}"})
-        except Exception:
-            pass
-        raise
+            try:
+                response = _worker_request(role, runner, device, sessions, fm_caches, request)
+            except Exception as exc:
+                response = {"error": f"{type(exc).__name__}: {exc}"}
+            connection.send(response)
+            # Do not pin tensors sent to the parent while the worker is idle.
+            del response, request
+    except (EOFError, OSError):
+        return
     finally:
         connection.close()
 
@@ -177,6 +189,8 @@ class ProcessStreamingRunner:
         self.config = PreTrainedConfig.from_pretrained(resolved)
         self.policy = SimpleNamespace(config=self.config)
         self._vlm_lock = Lock()
+        self._fm_lock = Lock()
+        self._session_id = ""
         self._fm_prefix_cache: Any = None
         self._fm_prefix_id: str | None = None
         context = mp.get_context("spawn")
@@ -202,13 +216,22 @@ class ProcessStreamingRunner:
             if ready.get("ready") != role:
                 raise RuntimeError(f"Unexpected {role.upper()} worker startup response: {ready!r}")
 
-    def encode_prefix(self, observation: ObservationSnapshot):
+    def for_session(self, session_id: str) -> ProcessStreamingRunner:
+        """Bind a session to the existing workers with its own prefix tracking."""
+        runner = copy(self)
+        runner._session_id = session_id
+        runner._fm_prefix_cache = None
+        runner._fm_prefix_id = None
+        return runner
+
+    def encode_prefix(self, observation: ObservationSnapshot) -> tuple[dict[str, Any], Any]:
         # A background refresh and a foreground reset must not receive each
         # other's replies from the same pipe.
         with self._vlm_lock:
             self._vlm_parent.send(
                 {
                     "op": "encode_prefix",
+                    "session_id": self._session_id,
                     "features": dict(observation.features),
                     "task": observation.task,
                     "sequence": observation.observation_id,
@@ -252,6 +275,7 @@ class ProcessStreamingRunner:
         cache_id = uuid4().hex if new_prefix else self._fm_prefix_id
         request = {
             "op": "predict_from_prefix",
+            "session_id": self._session_id,
             "cache_id": cache_id,
             "features": dict(observation.features),
             "task": observation.task,
@@ -265,12 +289,11 @@ class ProcessStreamingRunner:
         }
         if new_prefix:
             request["cache"] = prefix_cache
-        self._fm_parent.send(request)
-        result = self._fm_parent.recv()
+        with self._fm_lock:
+            self._fm_parent.send(request)
+            result = self._fm_parent.recv()
         if "error" in result:
             raise RuntimeError(result["error"])
-        # Retain the object, not just id(object), so Python cannot recycle its
-        # identity while the worker still has the corresponding GPU prefix.
         self._fm_prefix_cache = prefix_cache
         self._fm_prefix_id = cache_id
         actions = torch.from_numpy(np.asarray(result["actions"], dtype=np.float32))
@@ -286,32 +309,41 @@ class ProcessStreamingRunner:
             server_durations={},
         )
 
-    def reset(self, *, full: bool = True) -> None:
-        del full
+    def _session_control(self, op: str) -> None:
         self._fm_prefix_cache = None
         self._fm_prefix_id = None
-        with self._vlm_lock:
-            for connection in (self._vlm_parent, self._fm_parent):
-                try:
-                    connection.send({"op": "reset"})
-                except (BrokenPipeError, EOFError, OSError):
-                    continue
-            for connection in (self._vlm_parent, self._fm_parent):
-                try:
-                    connection.recv()
-                except (BrokenPipeError, EOFError, OSError):
-                    continue
+        errors: list[Exception] = []
+        for connection, lock in ((self._vlm_parent, self._vlm_lock), (self._fm_parent, self._fm_lock)):
+            try:
+                with lock:
+                    connection.send({"op": op, "session_id": self._session_id})
+                    response = connection.recv()
+                if "error" in response:
+                    raise RuntimeError(response["error"])
+            except (EOFError, OSError, RuntimeError) as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]
+
+    def reset(self, *, full: bool = True) -> None:
+        """Reset this session on both workers."""
+        self._session_control("reset")
+
+    def release(self) -> None:
+        """Release this session's worker allocations after disconnect."""
+        self._session_control("release")
 
     def close(self) -> None:
-        self._fm_prefix_cache = None
-        self._fm_prefix_id = None
-        with self._vlm_lock:
-            for connection in (self._vlm_parent, self._fm_parent):
+        """Shut down both shared workers when the server stops."""
+        for connection, lock in ((self._vlm_parent, self._vlm_lock), (self._fm_parent, self._fm_lock)):
+            with lock:
                 try:
                     connection.send({"op": "close"})
                     connection.recv()
-                except (BrokenPipeError, EOFError, OSError):
+                except (EOFError, OSError):
                     pass
+                finally:
+                    connection.close()
         for process in (self._vlm_process, self._fm_process):
             process.join(timeout=5)
             if process.is_alive():

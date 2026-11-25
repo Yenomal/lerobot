@@ -56,8 +56,9 @@ import logging
 import math
 from collections import deque
 from collections.abc import Iterator
+from copy import copy
 from pathlib import Path
-from typing import Any, Unpack
+from typing import Any, Self, Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -325,6 +326,19 @@ class SmolVLAPolicy(PreTrainedPolicy):
             raise RuntimeError(f"Missing keys: {missing_keys}; unexpected keys: {unexpected_keys}")
         log_model_loading_keys(missing_keys, unexpected_keys)
         return model
+
+    def fork_runtime_session(self) -> Self:
+        """Share loaded weights and keep streaming state on a separate model instance."""
+        policy = copy(self)
+        policy._modules = self._modules.copy()
+        policy.model = copy(self.model)
+        lambda_logger = getattr(self.model, "_tactile_cfg_lambda_logger", None)
+        policy.model._tactile_cfg_lambda_logger = None
+        policy.init_rtc_processor()
+        policy.reset()
+        if lambda_logger is not None:
+            policy.model._tactile_cfg_lambda_logger = TactileCFGLambdaLogger(lambda_logger.checkpoint)
+        return policy
 
     def reset(self):
         """This should be called whenever the environment is reset."""

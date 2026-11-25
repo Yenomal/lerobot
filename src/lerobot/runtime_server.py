@@ -1,4 +1,4 @@
-"""Standalone server-side Runtime for one observation/action control stream."""
+"""Standalone server-side Runtime for observation/action control streams."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ import concurrent.futures
 import logging
 import time
 from collections import deque
+from contextlib import suppress
 from pathlib import Path
-from typing import Any
-from uuid import uuid4
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -23,6 +23,9 @@ from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.policies.smolvla.tactile_hmm import TactileHMM
 from lerobot.runtime_protocol import PROTOCOL_VERSION, read_message, write_message
 from lerobot.transport.protocol import Envelope, ErrorCode, MessageType
+
+if TYPE_CHECKING:
+    from lerobot.runtime_workers import ProcessStreamingRunner
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +123,7 @@ def load_runtime_runner(checkpoint: str, device: str, *, exp_random_tactile: boo
     )
 
 
-def _validate_tactile_mode(runner: PolicyRunner, inference_mode: str) -> None:
+def _validate_tactile_mode(runner: PolicyRunner | ProcessStreamingRunner, inference_mode: str) -> None:
     if inference_mode not in (
         "stream-head-tactile",
         "stream-head-tactile-cfg",
@@ -144,7 +147,7 @@ class RuntimeSession:
 
     def __init__(
         self,
-        runner: PolicyRunner,
+        runner: PolicyRunner | ProcessStreamingRunner,
         queue_size: int,
         *,
         streaming_horizon: int | None = None,
@@ -324,6 +327,13 @@ class RuntimeSession:
             return {"observation_delay_chunks": delay}
         return {}
 
+    def _discard_prefix(self) -> None:
+        if self._prefix_future is not None and not self._prefix_future.cancel():
+            concurrent.futures.wait((self._prefix_future,))
+        self._prefix_future = None
+        self._prefix_bundle = None
+        self._prefix_execution_id = None
+
     def reset(self) -> None:
         self.actions.clear()
         self.pending = None
@@ -333,11 +343,7 @@ class RuntimeSession:
         self.execution_id = 0
         self._tactile_history.clear()
         self._tactile_hmm_posterior = None
-        if self._prefix_future is not None:
-            self._prefix_future.cancel()
-        self._prefix_future = None
-        self._prefix_bundle = None
-        self._prefix_execution_id = None
+        self._discard_prefix()
         self.runner.reset(full=True)
 
     def close(self) -> None:
@@ -360,15 +366,11 @@ class RuntimeSession:
         if self.task is not None and task != self.task:
             # Never execute a queued plan conditioned on an earlier instruction.
             self.actions.clear()
+            self._discard_prefix()
             self.runner.reset(full=True)
             self.execution_id = 0
             self._tactile_history.clear()
             self._tactile_hmm_posterior = None
-            if self._prefix_future is not None:
-                self._prefix_future.cancel()
-            self._prefix_future = None
-            self._prefix_bundle = None
-            self._prefix_execution_id = None
         self.task = task
         observation = self._observation(features, task, sequence)
         if self._streaming_enabled:
@@ -452,7 +454,7 @@ class RuntimeSession:
 class RuntimeServer:
     def __init__(
         self,
-        runner: PolicyRunner,
+        runner: PolicyRunner | ProcessStreamingRunner,
         host: str,
         port: int,
         queue_size: int,
@@ -475,7 +477,8 @@ class RuntimeServer:
         self.inference_mode = inference_mode
         self.context_cfg_lambda = context_cfg_lambda
         self.tactile_cfg_lambda = tactile_cfg_lambda
-        self._active = False
+        self._active_sessions: set[str] = set()
+        self._connections: dict[asyncio.StreamWriter, asyncio.Task[Any]] = {}
 
     async def serve(self) -> None:
         server = await asyncio.start_server(self._connection, self.host, self.port)
@@ -484,37 +487,25 @@ class RuntimeServer:
         # Keep a direct terminal signal after the socket bind. This remains
         # visible even when a caller's logging configuration filters INFO logs.
         print(f"Runtime server ready on {sockets}; workers initialized", flush=True)
-        async with server:
-            await server.serve_forever()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            server.close()
+            connections = list(self._connections.items())
+            for writer, _ in connections:
+                writer.close()
+            await asyncio.gather(*(task for _, task in connections), return_exceptions=True)
+            await server.wait_closed()
+            close_runner = getattr(self.runner, "close", None)
+            if callable(close_runner):
+                await asyncio.to_thread(close_runner)
 
     async def _connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        if self._active:
-            await write_message(
-                writer,
-                Envelope(
-                    MessageType.ERROR,
-                    "runtime",
-                    "client",
-                    request_id=uuid4().hex,
-                    body={
-                        "code": str(ErrorCode.BUSY),
-                        "message": "Runtime already has an active client",
-                    },
-                ),
-            )
-            writer.close()
-            await writer.wait_closed()
-            return
-        self._active = True
-        session = RuntimeSession(
-            self.runner,
-            self.queue_size,
-            streaming_horizon=self.streaming_horizon,
-            streaming_watermark=self.streaming_watermark,
-            inference_mode=self.inference_mode,
-            context_cfg_lambda=self.context_cfg_lambda,
-            tactile_cfg_lambda=self.tactile_cfg_lambda,
-        )
+        connection = asyncio.current_task()
+        assert connection is not None
+        self._connections[writer] = connection
+        session_id: str | None = None
+        session: RuntimeSession | None = None
         request: Envelope | None = None
         last_sequence = -1
         try:
@@ -522,6 +513,28 @@ class RuntimeServer:
                 request = await read_message(reader)
                 if request.body.get("protocol_version") != PROTOCOL_VERSION:
                     raise ValueError("Unsupported Runtime protocol version")
+                if session_id is None:
+                    if request.session_id in self._active_sessions:
+                        await write_message(
+                            writer,
+                            request.error(ErrorCode.BUSY, "Runtime session already has an active client"),
+                        )
+                        return
+                    session_id = request.session_id
+                    self._active_sessions.add(session_id)
+                    runner = await asyncio.to_thread(self.runner.for_session, session_id)
+                    session = RuntimeSession(
+                        runner,
+                        self.queue_size,
+                        streaming_horizon=self.streaming_horizon,
+                        streaming_watermark=self.streaming_watermark,
+                        inference_mode=self.inference_mode,
+                        context_cfg_lambda=self.context_cfg_lambda,
+                        tactile_cfg_lambda=self.tactile_cfg_lambda,
+                    )
+                elif request.session_id != session_id:
+                    raise ValueError("Runtime session ID changed on an active connection")
+                assert session is not None
                 if request.message_type is MessageType.CONTROL:
                     op = request.body.get("op")
                     if op == "reset":
@@ -556,20 +569,21 @@ class RuntimeServer:
             except Exception:
                 pass
         finally:
-            session.close()
             try:
-                await asyncio.to_thread(self.runner.reset, full=True)
+                if session is not None:
+                    await asyncio.to_thread(session.close)
+                    release = getattr(session.runner, "release", None)
+                    if callable(release):
+                        await asyncio.to_thread(release)
             except Exception:
-                logger.exception("Runtime policy reset failed after client disconnect")
-            close_runner = getattr(self.runner, "close", None)
-            if callable(close_runner):
-                try:
-                    await asyncio.to_thread(close_runner)
-                except Exception:
-                    logger.exception("Runtime worker shutdown failed")
-            self._active = False
-            writer.close()
-            await writer.wait_closed()
+                logger.exception("Runtime session cleanup failed for %s", session_id)
+            finally:
+                if session_id is not None:
+                    self._active_sessions.discard(session_id)
+                self._connections.pop(writer)
+                writer.close()
+                with suppress(ConnectionError):
+                    await writer.wait_closed()
 
 
 def main() -> None:
